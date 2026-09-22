@@ -5,10 +5,15 @@
 // updates state; it never sends, so a slow send can't delay it. The send
 // loop picks the next packet and hands it to QUIC. QUIC's SendDatagram blocks
 // while its queue is full, which paces the send loop at the congestion
-// controller's rate.
+// controller's rate — but that queue is 32 datagrams deep and FIFO, so a small
+// reply picked now can still depart behind bulk queued earlier. With
+// SendQueueTarget set, the loop holds bulk back to keep that queue shallow,
+// which trades throughput for that reply's latency and is off by default
+// (see pacer.go).
 package sender
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"log"
@@ -42,6 +47,12 @@ type Config struct {
 	// NoSeq ignores the client's HELLO, so sessions keep plain v1 DATA even
 	// when the client offers session sequence numbers.
 	NoSeq bool
+	// SendQueueTarget is how many datagrams the sender leaves sitting in QUIC's
+	// send queue ahead of the packet it picks next: 0 takes
+	// DefaultSendQueueTarget, which is off, and any negative value is off too,
+	// letting the queue run as deep as QUIC allows. A positive k paces, which
+	// trades bulk throughput for small-reply latency under loss (see pacer.go).
+	SendQueueTarget int
 }
 
 const (
@@ -82,6 +93,7 @@ func Serve(ctx context.Context, conn Conn, cfg Config) {
 		maxDatagram: cfg.InitialMaxDatagram,
 		now:         time.Now,
 	}
+	s.pacer.target = cmp.Or(cfg.SendQueueTarget, DefaultSendQueueTarget)
 	if cfg.NewDropper != nil {
 		s.drop = cfg.NewDropper()
 	}
@@ -124,6 +136,8 @@ type session struct {
 	m    *Metrics
 	now  func() time.Time
 	drop Dropper // nil unless injecting loss; used by the send loop only
+
+	pacer pacer // send loop only: keeps QUIC's send queue shallow
 
 	mu          sync.Mutex
 	rpcs        map[wire.RPCID]*rpc
@@ -303,6 +317,11 @@ type work struct {
 	kind    workKind
 	packet0 uint64 // for workMeta/workPacket0: the request generation this answers
 	seq     bool   // DATA goes out as DATA_SEQ (decided at pick, so the payload fits)
+	// bulk marks new data from an RPC with more left than QUIC's send queue
+	// holds. Such an RPC is limited by the wire rather than by the queue, so
+	// holding it back costs it nothing it won't get back, and it is the only
+	// thing the pacer ever delays (pacer.go).
+	bulk bool
 }
 
 type workKind int
@@ -330,6 +349,8 @@ func (s *session) sendLoop(ctx context.Context) {
 		w, ok := s.pick()
 		s.mu.Unlock()
 		if !ok {
+			// Out of work: the wire is no longer ours to measure.
+			s.pacer.idle()
 			select {
 			case <-ctx.Done():
 				return
@@ -339,10 +360,38 @@ func (s *session) sendLoop(ctx context.Context) {
 			}
 			continue
 		}
+		if w.bulk {
+			if d := s.pacer.wait(s.now()); d > 0 {
+				if !s.hold(ctx, d) {
+					return
+				}
+				continue // re-pick: something more urgent may have arrived meanwhile
+			}
+		}
 		if !s.send(ctx, w) {
 			return
 		}
 	}
+}
+
+// hold waits d for QUIC's send queue to drain, so the bulk datagram just
+// picked doesn't deepen a queue that a small reply may have to depart behind.
+// It returns false once the session is over. A wake cuts the wait short: the
+// caller re-picks, and a packet that became due meanwhile goes out first.
+func (s *session) hold(ctx context.Context, d time.Duration) bool {
+	s.m.PacedWaits.Add(1)
+	start := s.now()
+	timer := time.NewTimer(d)
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+		return false
+	case <-timer.C:
+	case <-s.wake:
+		timer.Stop()
+	}
+	s.m.PacedWaitMicros.Add(s.now().Sub(start).Microseconds())
+	return true
 }
 
 // pick chooses the next packet. Order: control replies, then META, then
@@ -383,7 +432,8 @@ func (s *session) pick() (work, bool) {
 		return work{pkt: r.data(sp.start, n), r: r, kind: workResend, seq: seq}, true
 	default:
 		n := min(chunk, r.granted-r.next)
-		return work{pkt: r.data(r.next, n), r: r, kind: workNew, seq: seq}, true
+		bulk := r.size-r.next > quicSendQueue*chunk
+		return work{pkt: r.data(r.next, n), r: r, kind: workNew, seq: seq, bulk: bulk}, true
 	}
 }
 
@@ -453,7 +503,7 @@ func (s *session) send(ctx context.Context, w work) bool {
 		s.m.DroppedData.Add(1)
 	} else if isMeta && s.drop != nil && s.drop(DropInfo{Meta: true, Resend: w.r.metaSent > 0}) {
 		s.m.DroppedMeta.Add(1)
-	} else if err := s.conn.SendDatagram(b); err != nil {
+	} else if err := s.transmit(b); err != nil {
 		var tooLarge *quic.DatagramTooLargeError
 		if errors.As(err, &tooLarge) && isData {
 			// Nothing was sent and nothing was recorded, so the same work is
@@ -510,6 +560,27 @@ func (s *session) send(ctx context.Context, w work) bool {
 	s.m.DataPackets.Add(1)
 	s.m.DataBytes.Add(int64(len(d.Payload)))
 	return true
+}
+
+// transmit hands one datagram to QUIC, timing the handover. A handover that
+// waits means QUIC's queue was full and one datagram left to make room, which
+// is the pacer's only view of how fast the wire is draining.
+func (s *session) transmit(b []byte) error {
+	start := s.now()
+	err := s.conn.SendDatagram(b)
+	at := s.now()
+	if err != nil {
+		return err
+	}
+	took := at.Sub(start)
+	blocked := took >= pacerBlocked
+	if blocked {
+		s.m.SendBlocked.Add(1)
+		s.m.SendBlockedMicros.Add(took.Microseconds())
+	}
+	s.pacer.sent(at, blocked)
+	s.m.PacerIntervalUs.Store(s.pacer.interval.Microseconds())
+	return nil
 }
 
 func (w work) dropInfo(d *wire.Data) DropInfo {

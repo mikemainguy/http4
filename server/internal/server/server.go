@@ -46,6 +46,10 @@ type Config struct {
 	AssetsDir string // directory HTTP4 REQs are served from
 	DropSpec  string // loss injection for outgoing DATA (sender.ParseDropSpec); testing only
 	NoSeq     bool   // ignore clients' HELLO: plain v1 DATA only (sender.Config.NoSeq)
+	// SendQueueTarget is how many datagrams the sender leaves in QUIC's send
+	// queue ahead of its next pick. 0 and negative values leave pacing off; a
+	// positive k paces bulk (sender.Config.SendQueueTarget).
+	SendQueueTarget int
 	// AdvertiseWT, if set, is the host:port put in the advertised WebTransport
 	// and echo URLs instead of the UDP listener's own address, e.g. an
 	// impairment proxy in front of it. The listener itself is unchanged.
@@ -228,7 +232,8 @@ func Start(cfg Config) (*Server, error) {
 	}
 	wtMux := http.NewServeMux()
 	wtMux.HandleFunc(WebTransportPath, s.upgrade(func(sess *webtransport.Session) {
-		sender.Serve(sess.Context(), sess, sender.Config{Assets: s.pool, Metrics: s.metrics, NewDropper: newDropper, NoSeq: cfg.NoSeq})
+		sender.Serve(sess.Context(), sess, sender.Config{Assets: s.pool, Metrics: s.metrics, NewDropper: newDropper, NoSeq: cfg.NoSeq,
+			SendQueueTarget: cfg.SendQueueTarget})
 	}))
 	wtMux.HandleFunc(EchoPath, s.upgrade(echoDatagrams))
 	if !cfg.NoH3 {

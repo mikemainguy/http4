@@ -26,6 +26,7 @@ type fakeConn struct {
 	mu        sync.Mutex
 	maxSize   int           // > 0: refuse larger datagrams like QUIC does
 	gate      chan struct{} // non-nil: each send waits for a token
+	queue     chan []byte   // non-nil: QUIC's send queue sits in front of out (see pacer_test.go)
 	ceiling   map[wire.RPCID]uint32
 	violation []string
 }
@@ -53,7 +54,7 @@ func (c *fakeConn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 
 func (c *fakeConn) SendDatagram(b []byte) error {
 	c.mu.Lock()
-	maxSize, gate := c.maxSize, c.gate
+	maxSize, gate, queue := c.maxSize, c.gate, c.queue
 	c.mu.Unlock()
 	if maxSize > 0 && len(b) > maxSize {
 		return &quic.DatagramTooLargeError{MaxDatagramPayloadSize: int64(maxSize)}
@@ -65,6 +66,19 @@ func (c *fakeConn) SendDatagram(b []byte) error {
 			return errors.New("closed")
 		}
 	}
+	if queue != nil {
+		select {
+		case queue <- bytes.Clone(b): // blocks once full, as QUIC's queue does
+			return nil
+		case <-c.closed:
+			return errors.New("closed")
+		}
+	}
+	return c.deliver(b)
+}
+
+// deliver checks one datagram against the grant oracle and hands it to the test.
+func (c *fakeConn) deliver(b []byte) error {
 	p, err := wire.Decode(b)
 	if err != nil {
 		c.t.Errorf("server sent undecodable datagram %x: %v", b, err)
