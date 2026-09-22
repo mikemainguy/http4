@@ -7,14 +7,15 @@ import (
 	"strings"
 )
 
-// DropInfo describes an outgoing DATA packet to a loss-injection rule.
+// DropInfo describes an outgoing DATA or META packet to a loss-injection rule.
 type DropInfo struct {
+	Meta    bool // a META packet; every other field describes DATA
 	Packet0 bool // offset 0
 	Final   bool // ends at total_size (and the asset is not empty)
 	Resend  bool // a retransmission, not the first time these bytes go out
 }
 
-// Dropper decides whether to drop an outgoing DATA packet, simulating loss
+// Dropper decides whether to drop an outgoing packet, simulating loss
 // on the wire. The sender treats a dropped packet as sent. Testing only.
 type Dropper func(DropInfo) bool
 
@@ -25,13 +26,15 @@ type Dropper func(DropInfo) bool
 //	every=N   drop every Nth DATA packet sent in the session (N >= 2)
 //	packet0   drop the first transmission of each RPC's packet 0
 //	final     drop the first transmission of each RPC's final chunk
+//	meta      drop the first transmission of each RPC's META
 //	rate=P    drop each DATA packet with probability P (0 < P < 1)
 //	seed=S    seed for rate (default 1)
 //
-// Only first transmissions are targeted by packet0/final, so recovery can succeed.
+// Only first transmissions are targeted by packet0/final/meta, so recovery
+// can succeed. every and rate count DATA packets only.
 func ParseDropSpec(spec string) (func() Dropper, error) {
 	var every int
-	var packet0, final bool
+	var packet0, final, meta bool
 	var rate float64
 	var seed uint64 = 1
 	for part := range strings.SplitSeq(spec, ",") {
@@ -51,6 +54,8 @@ func ParseDropSpec(spec string) (func() Dropper, error) {
 			packet0 = true
 		case "final":
 			final = true
+		case "meta":
+			meta = true
 		case "rate":
 			rate, err = strconv.ParseFloat(val, 64)
 			if err == nil && (rate <= 0 || rate >= 1) {
@@ -65,13 +70,16 @@ func ParseDropSpec(spec string) (func() Dropper, error) {
 			return nil, fmt.Errorf("drop spec %q: %w", part, err)
 		}
 	}
-	if every == 0 && !packet0 && !final && rate == 0 {
+	if every == 0 && !packet0 && !final && !meta && rate == 0 {
 		return nil, nil
 	}
 	return func() Dropper {
 		n := 0
 		rng := rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
 		return func(d DropInfo) bool {
+			if d.Meta {
+				return meta && !d.Resend
+			}
 			n++
 			switch {
 			case every > 0 && n%every == 0:

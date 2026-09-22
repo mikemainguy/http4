@@ -66,6 +66,13 @@ func packetFromJSON(t *testing.T, m map[string]any) Packet {
 		return &Resend{RPCID: rpc, Start: u32("start"), End: u32("end")}
 	case "ERROR":
 		return &Error{RPCID: rpc, Code: ErrorCode(u32("code"))}
+	case "META":
+		fields := []Field{}
+		for _, f := range m["fields"].([]any) {
+			kv := f.([]any)
+			fields = append(fields, Field{Name: kv[0].(string), Value: kv[1].(string)})
+		}
+		return &Meta{RPCID: rpc, Fields: fields}
 	}
 	t.Fatalf("unknown vector type %v", m["type"])
 	return nil
@@ -111,6 +118,10 @@ func TestEncodeRejectsWhatDecodeRejects(t *testing.T) {
 		"non-UTF-8 id":     &Req{AssetID: "\xff"},
 		"data past total":  &Data{TotalSize: 2, Offset: 1, Payload: []byte{1, 2}},
 		"empty resend":     &Resend{Start: 5, End: 5},
+		"meta bad name":    &Meta{Fields: []Field{{"server", "go"}}},
+		"meta duplicate":   &Meta{Fields: []Field{{"etag", `"a"`}, {"etag", `"b"`}}},
+		"meta empty value": &Meta{Fields: []Field{{"etag", ""}}},
+		"meta non-ASCII":   &Meta{Fields: []Field{{"content-type", "é"}}},
 	} {
 		if _, err := Marshal(p); !errors.Is(err, ErrMalformed) {
 			t.Errorf("%s: err = %v, want ErrMalformed", name, err)

@@ -15,3 +15,6 @@ client/dist/
 # generated fixtures (scripts/gen-fixtures); the manifest is committed
 testdata/assets/*
 !testdata/assets/manifest.json
+
+# agent worktrees (Claude Code)
+.claude/worktrees/

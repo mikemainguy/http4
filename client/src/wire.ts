@@ -7,6 +7,7 @@ export const PacketType = {
   GRANT: 0x03,
   RESEND: 0x04,
   ERROR: 0x05,
+  META: 0x06,
 } as const;
 
 export const ErrorCode = {
@@ -21,6 +22,12 @@ const REQ_FIXED_LEN = HEADER_LEN + 6; // + initial_grant + id_len
 const GRANT_LEN = HEADER_LEN + 5;
 const RESEND_LEN = HEADER_LEN + 8;
 const ERROR_LEN = HEADER_LEN + 1;
+const META_FIXED_LEN = HEADER_LEN + 1; // + count
+const MAX_META_VALUE = 0xffff;
+
+/** The only field names META may carry. Bodies are raw bytes: no content-encoding. */
+export const META_NAMES = ["content-type", "etag", "last-modified", "cache-control"] as const;
+export type MetaName = (typeof META_NAMES)[number];
 const U32_MAX = 0xffff_ffff;
 
 export interface Req {
@@ -58,7 +65,13 @@ export interface ErrorPacket {
   code: number;
 }
 
-export type Packet = Req | Data | Grant | Resend | ErrorPacket;
+export interface Meta {
+  type: "META";
+  rpcId: bigint;
+  fields: [name: string, value: string][]; // wire order
+}
+
+export type Packet = Req | Data | Grant | Resend | ErrorPacket | Meta;
 
 export class MalformedPacketError extends Error {
   override name = "MalformedPacketError";
@@ -117,6 +130,25 @@ export function decode(b: Uint8Array): Packet {
     case PacketType.ERROR:
       if (b.length !== ERROR_LEN) throw new MalformedPacketError(`ERROR is ${b.length} bytes, want ${ERROR_LEN}`);
       return { type: "ERROR", rpcId, code: v.getUint8(9) };
+    case PacketType.META: {
+      if (b.length < META_FIXED_LEN) throw new MalformedPacketError(`META is ${b.length} bytes, need at least ${META_FIXED_LEN}`);
+      const p: Meta = { type: "META", rpcId, fields: [] };
+      let at = META_FIXED_LEN;
+      for (let i = 0; i < b[9]!; i++) {
+        if (at + 1 > b.length) throw new MalformedPacketError(`META truncated before field ${i}`);
+        const n = b[at]!;
+        if (at + 1 + n + 2 > b.length) throw new MalformedPacketError(`META field ${i} truncated`);
+        const name = latin1(b.subarray(at + 1, at + 1 + n));
+        const m = v.getUint16(at + 1 + n);
+        at += 3 + n;
+        if (at + m > b.length) throw new MalformedPacketError(`META value of ${JSON.stringify(name)} truncated`);
+        p.fields.push([name, latin1(b.subarray(at, at + m))]);
+        at += m;
+      }
+      if (at !== b.length) throw new MalformedPacketError(`META has ${b.length - at} trailing bytes`);
+      checkMeta(p);
+      return p;
+    }
   }
   throw new MalformedPacketError(`unknown type 0x${type!.toString(16).padStart(2, "0")}`);
 }
@@ -169,6 +201,21 @@ export function encode(p: Packet): Uint8Array<ArrayBuffer> {
       v.setUint8(9, p.code);
       return b;
     }
+    case "META": {
+      checkMeta(p);
+      const len = p.fields.reduce((n, [name, value]) => n + 3 + name.length + value.length, META_FIXED_LEN);
+      const { b, v } = header(PacketType.META, p.rpcId, len);
+      v.setUint8(9, p.fields.length);
+      let at = META_FIXED_LEN;
+      for (const [name, value] of p.fields) {
+        v.setUint8(at, name.length);
+        writeAscii(b, at + 1, name);
+        v.setUint16(at + 1 + name.length, value.length);
+        writeAscii(b, at + 3 + name.length, value);
+        at += 3 + name.length + value.length;
+      }
+      return b;
+    }
   }
 }
 
@@ -185,6 +232,36 @@ function checkDataBounds(p: Data): void {
   if (p.offset + p.payload.length > p.totalSize) {
     throw new MalformedPacketError(`DATA [${p.offset}, ${p.offset + p.payload.length}) runs past total_size ${p.totalSize}`);
   }
+}
+
+/** Shared by decode and encode; names and values are ASCII, so one char = one byte. */
+function checkMeta(p: Meta): void {
+  if (p.fields.length > META_NAMES.length) throw new MalformedPacketError(`META has ${p.fields.length} fields, at most ${META_NAMES.length} allowed`);
+  const seen = new Set<string>();
+  for (const [name, value] of p.fields) {
+    if (!(META_NAMES as readonly string[]).includes(name)) throw new MalformedPacketError(`META field name ${JSON.stringify(name)} not allowed`);
+    if (seen.has(name)) throw new MalformedPacketError(`META field ${JSON.stringify(name)} repeated`);
+    seen.add(name);
+    if (!validMetaValue(value)) {
+      throw new MalformedPacketError(`META value of ${JSON.stringify(name)} must be 1..${MAX_META_VALUE} printable ASCII bytes without surrounding spaces`);
+    }
+  }
+}
+
+// Non-empty printable ASCII (0x20-0x7e), no leading or trailing space.
+function validMetaValue(v: string): boolean {
+  return v.length > 0 && v.length <= MAX_META_VALUE && /^[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?$/.test(v);
+}
+
+// Byte-for-char decoding; checkMeta then rejects anything outside printable ASCII.
+function latin1(b: Uint8Array): string {
+  let s = "";
+  for (const c of b) s += String.fromCharCode(c);
+  return s;
+}
+
+function writeAscii(b: Uint8Array, at: number, s: string): void {
+  for (let i = 0; i < s.length; i++) b[at + i] = s.charCodeAt(i);
 }
 
 function checkResendRange(p: Resend): void {

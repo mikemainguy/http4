@@ -39,6 +39,19 @@ func TestDropRules(t *testing.T) {
 	if !d(DropInfo{Final: true}) || d(DropInfo{Final: true, Resend: true}) {
 		t.Error("final must drop the first transmission only")
 	}
+	if d(DropInfo{Meta: true}) {
+		t.Error("META dropped without the meta rule")
+	}
+
+	newDropper, _ = ParseDropSpec("meta,every=2")
+	d = newDropper()
+	if !d(DropInfo{Meta: true}) || d(DropInfo{Meta: true, Resend: true}) {
+		t.Error("meta must drop the first transmission only")
+	}
+	// META doesn't advance the every=N counter: the 2nd DATA is still the one dropped.
+	if d(DropInfo{}) || !d(DropInfo{}) {
+		t.Error("every=2 must count DATA packets only")
+	}
 }
 
 func TestDropRateIsSeededAndRoughlyRight(t *testing.T) {

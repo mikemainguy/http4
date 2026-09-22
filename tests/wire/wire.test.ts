@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { decode, encode, maxPayload, newRpcId, MalformedPacketError, type Packet } from "../../client/src/wire.ts";
 
 interface Vectors {
-  valid: { name: string; hex: string; packet: Record<string, string | number> }[];
+  valid: { name: string; hex: string; packet: Record<string, string | number | [string, string][]> }[];
   invalid: { name: string; hex: string }[];
 }
 
@@ -19,7 +19,7 @@ const vectors: Vectors = JSON.parse(
 const fromHex = (h: string) => Uint8Array.from(Buffer.from(h, "hex"));
 const toHex = (b: Uint8Array) => Buffer.from(b).toString("hex");
 
-function packetFromJSON(m: Record<string, string | number>): Packet {
+function packetFromJSON(m: Record<string, string | number | [string, string][]>): Packet {
   const rpcId = BigInt("0x" + m.rpcId);
   switch (m.type) {
     case "REQ":
@@ -32,6 +32,8 @@ function packetFromJSON(m: Record<string, string | number>): Packet {
       return { type: "RESEND", rpcId, start: m.start as number, end: m.end as number };
     case "ERROR":
       return { type: "ERROR", rpcId, code: m.code as number };
+    case "META":
+      return { type: "META", rpcId, fields: m.fields as [string, string][] };
   }
   throw new Error(`unknown vector type ${m.type}`);
 }
@@ -71,6 +73,11 @@ test("encode rejects what decode rejects", () => {
     { type: "GRANT", rpcId, maxOffset: 0, priority: 256 },
     { type: "GRANT", rpcId: 2n ** 64n, maxOffset: 0, priority: 0 },
     { type: "RESEND", rpcId, start: 5, end: 5 },
+    { type: "META", rpcId, fields: [["server", "go"]] },
+    { type: "META", rpcId, fields: [["etag", '"a"'], ["etag", '"b"']] },
+    { type: "META", rpcId, fields: [["etag", ""]] },
+    { type: "META", rpcId, fields: [["content-type", "é"]] },
+    { type: "META", rpcId, fields: [["cache-control", "no-store "]] },
   ];
   for (const p of bad) assert.throws(() => encode(p), MalformedPacketError, JSON.stringify(p, (_, x) => (typeof x === "bigint" ? `${x}n` : x)));
 });

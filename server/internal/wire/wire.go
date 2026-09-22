@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"slices"
 	"unicode/utf8"
 )
 
@@ -18,6 +19,7 @@ const (
 	TypeGrant  Type = 0x03
 	TypeResend Type = 0x04
 	TypeError  Type = 0x05
+	TypeMeta   Type = 0x06
 )
 
 func (t Type) String() string {
@@ -32,6 +34,8 @@ func (t Type) String() string {
 		return "RESEND"
 	case TypeError:
 		return "ERROR"
+	case TypeMeta:
+		return "META"
 	}
 	return fmt.Sprintf("Type(0x%02x)", uint8(t))
 }
@@ -51,7 +55,13 @@ const (
 	grantLen      = HeaderLen + 5
 	resendLen     = HeaderLen + 8
 	errorLen      = HeaderLen + 1
+	metaFixedLen  = HeaderLen + 1 // + count
 )
+
+// MetaNames are the only field names a META packet may carry, in the order
+// the server sends them. Bodies are always raw bytes, so there is no
+// content-encoding.
+var MetaNames = []string{"content-type", "etag", "last-modified", "cache-control"}
 
 // MaxPayload is the most asset bytes one DATA packet can carry in a datagram
 // of maxDatagramSize bytes.
@@ -96,16 +106,38 @@ type Error struct {
 	Code  ErrorCode
 }
 
+// Meta carries an RPC's response metadata. Fields keep their wire order.
+type Meta struct {
+	RPCID  RPCID
+	Fields []Field
+}
+
+type Field struct {
+	Name, Value string
+}
+
+// Get returns the value of the named field.
+func (p *Meta) Get(name string) (string, bool) {
+	for _, f := range p.Fields {
+		if f.Name == name {
+			return f.Value, true
+		}
+	}
+	return "", false
+}
+
 func (p *Req) Type() Type    { return TypeReq }
 func (p *Data) Type() Type   { return TypeData }
 func (p *Grant) Type() Type  { return TypeGrant }
 func (p *Resend) Type() Type { return TypeResend }
 func (p *Error) Type() Type  { return TypeError }
+func (p *Meta) Type() Type   { return TypeMeta }
 func (p *Req) RPC() RPCID    { return p.RPCID }
 func (p *Data) RPC() RPCID   { return p.RPCID }
 func (p *Grant) RPC() RPCID  { return p.RPCID }
 func (p *Resend) RPC() RPCID { return p.RPCID }
 func (p *Error) RPC() RPCID  { return p.RPCID }
+func (p *Meta) RPC() RPCID   { return p.RPCID }
 
 // ErrMalformed is wrapped by every decode and encode rejection.
 var ErrMalformed = errors.New("wire: malformed packet")
@@ -175,6 +207,37 @@ func Decode(b []byte) (Packet, error) {
 			return nil, malformed("ERROR is %d bytes, want %d", len(b), errorLen)
 		}
 		return &Error{RPCID: id, Code: ErrorCode(b[9])}, nil
+
+	case TypeMeta:
+		if len(b) < metaFixedLen {
+			return nil, malformed("META is %d bytes, need at least %d", len(b), metaFixedLen)
+		}
+		p := &Meta{RPCID: id, Fields: []Field{}}
+		rest := b[metaFixedLen:]
+		for range int(b[9]) {
+			if len(rest) < 1 {
+				return nil, malformed("META truncated before field %d", len(p.Fields))
+			}
+			n := int(rest[0])
+			if len(rest) < 1+n+2 {
+				return nil, malformed("META field %d truncated", len(p.Fields))
+			}
+			name := string(rest[1 : 1+n])
+			m := int(binary.BigEndian.Uint16(rest[1+n : 3+n]))
+			rest = rest[3+n:]
+			if len(rest) < m {
+				return nil, malformed("META value of %q truncated", name)
+			}
+			p.Fields = append(p.Fields, Field{Name: name, Value: string(rest[:m])})
+			rest = rest[m:]
+		}
+		if len(rest) != 0 {
+			return nil, malformed("META has %d trailing bytes", len(rest))
+		}
+		if err := p.check(); err != nil {
+			return nil, err
+		}
+		return p, nil
 	}
 	return nil, malformed("unknown type 0x%02x", uint8(t))
 }
@@ -185,6 +248,43 @@ func (p *Data) checkBounds() error {
 		return malformed("DATA [%d, %d) runs past total_size %d", p.Offset, uint64(p.Offset)+uint64(len(p.Payload)), p.TotalSize)
 	}
 	return nil
+}
+
+// check enforces the per-field rules shared by Decode and Append.
+func (p *Meta) check() error {
+	if len(p.Fields) > len(MetaNames) {
+		return malformed("META has %d fields, at most %d allowed", len(p.Fields), len(MetaNames))
+	}
+	for i, f := range p.Fields {
+		if !slices.Contains(MetaNames, f.Name) {
+			return malformed("META field name %q not allowed", f.Name)
+		}
+		for _, g := range p.Fields[:i] {
+			if g.Name == f.Name {
+				return malformed("META field %q repeated", f.Name)
+			}
+		}
+		if !validMetaValue(f.Value) {
+			return malformed("META value of %q must be 1..%d printable ASCII bytes without surrounding spaces", f.Name, maxMetaValue)
+		}
+	}
+	return nil
+}
+
+const maxMetaValue = 0xffff
+
+// validMetaValue accepts non-empty printable ASCII (0x20-0x7e) with no
+// leading or trailing space: the safe subset of an HTTP field value.
+func validMetaValue(v string) bool {
+	if len(v) == 0 || len(v) > maxMetaValue || v[0] == ' ' || v[len(v)-1] == ' ' {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		if v[i] < 0x20 || v[i] > 0x7e {
+			return false
+		}
+	}
+	return true
 }
 
 // Append encodes p onto dst. It refuses any packet Decode would reject, so
@@ -222,6 +322,18 @@ func Append(dst []byte, p Packet) ([]byte, error) {
 		return binary.BigEndian.AppendUint32(dst, p.End), nil
 	case *Error:
 		return append(dst, byte(p.Code)), nil
+	case *Meta:
+		if err := p.check(); err != nil {
+			return nil, err
+		}
+		dst = append(dst, byte(len(p.Fields)))
+		for _, f := range p.Fields {
+			dst = append(dst, byte(len(f.Name)))
+			dst = append(dst, f.Name...)
+			dst = binary.BigEndian.AppendUint16(dst, uint16(len(f.Value)))
+			dst = append(dst, f.Value...)
+		}
+		return dst, nil
 	}
 	return nil, fmt.Errorf("wire: cannot encode %T", p)
 }

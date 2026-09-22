@@ -1,9 +1,13 @@
 // HTTP4 client session over WebTransport datagrams: sends REQs, reassembles
 // DATA, issues GRANTs from the SRPT scheduler, and recovers lost datagrams.
 //
-// Loss recovery: a transfer that has bytes outstanding but hasn't made progress
-// for one RTO is "stalled". If its size is still unknown (REQ or packet 0 was
-// lost), the REQ is sent again under the same rpc_id. Otherwise its current
+// A transfer completes when it has both every body byte and the META packet
+// carrying its response metadata (Content-Type etc.).
+//
+// Loss recovery: a transfer that has bytes outstanding, or no META yet, but
+// hasn't made progress for one RTO is "stalled". If its size or its META is
+// still missing (the REQ, META or packet 0 was lost), the REQ is sent again
+// under the same rpc_id; the server answers with META and packet 0 again. Otherwise its current
 // GRANT is re-sent (a GRANT may have been lost) along with a RESEND for each
 // missing range below the grant. The timeout doubles on each attempt without
 // progress, and the transfer fails after `maxRecoveries` attempts.
@@ -38,6 +42,7 @@ export interface ClientStats {
   reqsSent: number;
   reqRetransmits: number;
   resendsSent: number;
+  metaIn: number;
   recoveries: number;
   droppedOutgoing: number;
   srttMs: number | null;
@@ -53,12 +58,44 @@ export class Http4Error extends Error {
   }
 }
 
+/** A completed HTTP4 request: the body and the server's META fields. */
+export interface Http4Response {
+  body: Uint8Array<ArrayBuffer>;
+  headers: Record<string, string>; // lowercase names, e.g. "content-type"
+}
+
+/**
+ * HTTP status to report for a failed HTTP4 request, e.g. when building a
+ * platform Response:
+ *
+ *   NOT_FOUND   → 404
+ *   BAD_REQUEST → 400
+ *   UNKNOWN_RPC → 503  the server dropped the request's state (idle
+ *                      eviction); retrying with a new REQ can succeed
+ *   anything else, including stalls, session loss and unknown codes → 502
+ */
+export function httpStatusFor(err: unknown): number {
+  if (err instanceof Http4Error) {
+    switch (err.code) {
+      case ErrorCode.NOT_FOUND:
+        return 404;
+      case ErrorCode.BAD_REQUEST:
+        return 400;
+      case ErrorCode.UNKNOWN_RPC:
+        return 503;
+    }
+  }
+  return 502;
+}
+
 interface Transfer {
   rpcId: bigint;
   assetId: string;
   initialGrant: number;
   asm?: Reassembly; // set once the first DATA reveals the size
-  resolve(b: Uint8Array<ArrayBuffer>): void;
+  headers?: Record<string, string>; // set by the first META
+  replied: boolean; // anything has arrived for it (RTT sample taken)
+  resolve(r: Http4Response): void;
   reject(e: Error): void;
   reqSentAt: number;
   reqRetransmitted: boolean; // Karn: no RTT sample from an ambiguous REQ
@@ -111,7 +148,7 @@ export class Http4Client {
     this.dropOutgoing = opts.dropOutgoing;
     this.stats = {
       packetsIn: 0, malformedIn: 0, dataBytesIn: 0, duplicateBytesIn: 0, grantsSent: 0, reqsSent: 0,
-      reqRetransmits: 0, resendsSent: 0, recoveries: 0, droppedOutgoing: 0, srttMs: null, rtoMs: this.rto(),
+      reqRetransmits: 0, resendsSent: 0, metaIn: 0, recoveries: 0, droppedOutgoing: 0, srttMs: null, rtoMs: this.rto(),
     };
     void this.readLoop();
     void wt.closed.finally(() => this.failAll(new Http4Error("session closed")));
@@ -125,6 +162,11 @@ export class Http4Client {
 
   /** Fetch one asset by ID. Resolves with its bytes. */
   fetch(assetId: string): Promise<Uint8Array<ArrayBuffer>> {
+    return this.request(assetId).then((r) => r.body);
+  }
+
+  /** Fetch one asset by ID. Resolves with its bytes and metadata. */
+  request(assetId: string): Promise<Http4Response> {
     if (this.closed) return Promise.reject(new Http4Error("client closed"));
     const rpcId = newRpcId();
     const req: Packet = { type: "REQ", rpcId, initialGrant: this.initialGrant, assetId };
@@ -135,7 +177,7 @@ export class Http4Client {
     return new Promise((resolve, reject) => {
       const now = performance.now();
       this.transfers.set(rpcId, {
-        rpcId, assetId, initialGrant: this.initialGrant, resolve, reject,
+        rpcId, assetId, initialGrant: this.initialGrant, replied: false, resolve, reject,
         reqSentAt: now, reqRetransmitted: false, lastProgress: now, recoveries: 0,
       });
       this.startTicker();
@@ -203,12 +245,24 @@ export class Http4Client {
   private handle(p: Packet): void {
     const t = this.transfers.get(p.rpcId);
     if (!t) return; // finished, failed, or not ours
+    if (!t.replied && (p.type === "META" || p.type === "DATA")) {
+      t.replied = true;
+      if (!t.reqRetransmitted) this.sampleRtt(performance.now() - t.reqSentAt);
+    }
     switch (p.type) {
+      case "META": {
+        this.stats.metaIn++;
+        if (t.headers) return; // a repeat, after a retransmitted REQ
+        t.headers = Object.fromEntries(p.fields);
+        t.lastProgress = performance.now();
+        t.recoveries = 0;
+        if (t.asm?.complete) this.finish(t);
+        return;
+      }
       case "DATA": {
         if (!t.asm) {
           t.asm = new Reassembly(p.totalSize);
           this.scheduler.add(t.rpcId, p.totalSize, t.initialGrant, 0);
-          if (!t.reqRetransmitted) this.sampleRtt(performance.now() - t.reqSentAt);
         } else if (p.totalSize !== t.asm.size) {
           return this.finish(t, new Http4Error(`total_size changed from ${t.asm.size} to ${p.totalSize}`));
         }
@@ -225,7 +279,7 @@ export class Http4Client {
           t.lastProgress = performance.now();
           t.recoveries = 0;
         }
-        if (t.asm.complete) this.finish(t);
+        if (t.asm.complete && t.headers) this.finish(t);
         return;
       }
       case "ERROR": {
@@ -255,7 +309,7 @@ export class Http4Client {
     const now = performance.now();
     for (const t of [...this.transfers.values()]) {
       const granted = t.asm ? (this.scheduler.granted(t.rpcId) ?? 0) : 0;
-      const waiting = t.asm !== undefined && t.asm.received >= granted;
+      const waiting = t.asm !== undefined && t.headers !== undefined && t.asm.received >= granted;
       if (waiting) {
         // Nothing outstanding: it's queued behind shorter transfers, not stalled.
         t.lastProgress = now;
@@ -277,12 +331,13 @@ export class Http4Client {
     }
     this.stats.recoveries++;
     t.lastProgress = now; // the next attempt waits a (doubled) timeout from here
-    if (!t.asm) {
-      // Neither packet 0 nor any other DATA arrived: the REQ or its reply was lost.
+    if (!t.asm || !t.headers) {
+      // No size or no META yet: the REQ or part of its reply was lost. A
+      // repeated REQ makes the server send META and packet 0 again.
       t.reqRetransmitted = true;
       this.stats.reqRetransmits++;
       this.send({ type: "REQ", rpcId: t.rpcId, initialGrant: t.initialGrant, assetId: t.assetId });
-      return;
+      if (!t.asm) return;
     }
     // The server may never have seen our latest GRANT; grants are idempotent.
     if (granted > t.initialGrant) this.send({ type: "GRANT", rpcId: t.rpcId, maxOffset: granted, priority: 0 });
@@ -296,7 +351,7 @@ export class Http4Client {
     this.transfers.delete(t.rpcId);
     this.scheduler.remove(t.rpcId);
     if (err) t.reject(err);
-    else t.resolve(t.asm!.bytes);
+    else t.resolve({ body: t.asm!.bytes, headers: t.headers! });
     this.pumpGrants(); // its budget is free for the others
   }
 
