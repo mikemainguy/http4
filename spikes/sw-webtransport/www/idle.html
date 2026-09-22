@@ -1,0 +1,31 @@
+<!doctype html>
+<meta charset="utf-8"><title>SW idle probe</title>
+<script>
+// No DevTools attached: results go to the console, which Chrome logs to stderr.
+const report = () => new Promise((resolve) => {
+  navigator.serviceWorker.addEventListener("message", (e) => resolve(e.data), { once: true });
+  navigator.serviceWorker.controller.postMessage("report");
+});
+const probe = async (label) => {
+  const t0 = performance.now();
+  const r = await fetch("/assets/data.json");
+  const rep = await report();
+  console.log("SPIKE " + JSON.stringify({ label, status: r.status, servedBy: r.headers.get("x-served-by"), ms: Math.round(performance.now() - t0), startedAt: rep.startedAt, connects: rep.connects }));
+  return rep.startedAt;
+};
+(async () => {
+  await navigator.serviceWorker.register("/sw.js");
+  await navigator.serviceWorker.ready;
+  while (!navigator.serviceWorker.controller) await new Promise((r) => setTimeout(r, 50));
+  const first = await probe("start");
+  let prev = first;
+  for (const gap of [45, 75]) {
+    // One uninterrupted gap: no fetches or messages reach the worker meanwhile.
+    await new Promise((r) => setTimeout(r, gap * 1000));
+    const now = await probe(`after a ${gap}s idle gap`);
+    console.log("SPIKE " + JSON.stringify({ label: `worker restarted during ${gap}s gap`, restarted: now !== prev }));
+    prev = now;
+  }
+  console.log("SPIKE done");
+})();
+</script>

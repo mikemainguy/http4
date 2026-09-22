@@ -1,0 +1,15 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>SW spike</title></head>
+<body>
+<!-- Present in the initial HTML: requested before any Service Worker controls the page. -->
+<img id="first" src="/assets/pic.png">
+<script>
+  window.__registered = navigator.serviceWorker.register("/sw.js").then(() => navigator.serviceWorker.ready).then(() => true);
+  window.swReport = () => new Promise((resolve) => {
+    navigator.serviceWorker.addEventListener("message", (e) => resolve(e.data), { once: true });
+    navigator.serviceWorker.controller.postMessage("report");
+  });
+</script>
+</body>
+</html>
