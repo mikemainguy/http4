@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <!-- Same as index.html without the gallery: the baseline for the stylesheet-timing comparison (G4). -->
+  <script src="/http4/auto.js"></script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>Field Notes (text only) · HTTP4 demo</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header class="masthead">
+    <h1>Field Notes</h1>
+    <p class="tagline">The same page without its pictures.</p>
+    <nav class="modes" id="modes" aria-label="Transport"></nav>
+  </header>
+  <main>
+    <article class="intro">
+      <h2>On carrying pictures</h2>
+      <p>This is the text-only version of the page, with the same stylesheet, font and JSON calls and none of the
+        photographs. Comparing how fast its stylesheet arrives with the full page shows how much the big images
+        get in the way of the small, layout-blocking file.</p>
+    </article>
+    <div class="columns">
+      <section class="notes">
+        <h2>Latest notes</h2>
+        <ul id="articles"><li class="loading">Loading…</li></ul>
+      </section>
+      <section class="comments">
+        <h2>Comments</h2>
+        <ul id="comments"><li class="loading">Loading…</li></ul>
+      </section>
+    </div>
+    <p class="stats" id="stats"></p>
+  </main>
+  <aside class="panel" id="panel" aria-label="Protocol panel"></aside>
+</body>
+</html>

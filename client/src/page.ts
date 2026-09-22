@@ -4,7 +4,7 @@
 // <script src="/http4/auto.js"></script> (auto.ts), but install() can be
 // called directly for control over the options.
 
-import { open, type ConnectOptions, type Http4, type Opened } from "./index.ts";
+import { open, openDisabled, type ConnectOptions, type Http4, type Opened } from "./index.ts";
 import { SW_URL, isSwMessage, serveReply, type HelloReply, type SwRequestReport } from "./swproto.ts";
 
 export interface InstallOptions extends ConnectOptions {
@@ -14,6 +14,17 @@ export interface InstallOptions extends ConnectOptions {
   scope?: string;
   /** Set false to only answer an already-registered worker, without registering one. */
   register?: boolean;
+  /**
+   * Turn HTTP4 off for this page: no session is opened and no worker is
+   * registered, and an already-registered worker is told at once to use the
+   * network, so it doesn't wait for a session that will never come.
+   */
+  disabled?: boolean;
+}
+
+/** A worker report entry as this tab received it, stamped with when (performance.now()). */
+export interface PageRequestReport extends SwRequestReport {
+  at: number;
 }
 
 /** What install() returns: this tab's HTTP4 handle plus the worker's view of requests. */
@@ -24,21 +35,48 @@ export interface Http4Page {
   readonly registration: Promise<ServiceWorkerRegistration | null>;
   /** Whether a worker controls this page, i.e. its subresource requests are being forwarded. */
   readonly controlled: boolean;
-  /** How the worker served this tab's requests (or every tab's, with all), oldest first. */
-  report(opts?: { all?: boolean }): Promise<SwRequestReport[]>;
+  /** Whether HTTP4 was turned off for this page (InstallOptions.disabled). */
+  readonly disabled: boolean;
+  /**
+   * How the worker served this tab's requests, oldest first. The tab keeps
+   * its own copy, which survives Chrome stopping the idle worker. With all,
+   * asks the worker for every tab's requests (only what it still remembers).
+   */
+  report(opts?: { all?: boolean }): Promise<PageRequestReport[] | SwRequestReport[]>;
+  /** Call `listener` for each new report entry of this tab. Returns an unsubscribe function. */
+  onReport(listener: (r: PageRequestReport) => void): () => void;
 }
 
+const MIRROR_LIMIT = 2000;
+export const DISABLED_REASON = "HTTP4 disabled for this page";
+
 export function install(opts: InstallOptions = {}): Http4Page {
-  const { swUrl = SW_URL, scope = "/", register = true, ...connectOpts } = opts;
-  const opened = open(connectOpts);
+  const { swUrl = SW_URL, scope = "/", register = true, disabled = false, ...connectOpts } = opts;
+  const opened = disabled
+    ? Promise.resolve(openDisabled(DISABLED_REASON, connectOpts))
+    : open(connectOpts);
   const container = typeof navigator !== "undefined" ? navigator.serviceWorker : undefined;
+  const mirror: PageRequestReport[] = [];
+  const listeners = new Set<(r: PageRequestReport) => void>();
 
   if (container) {
-    container.addEventListener("message", (e) => answer(e, opened, new URL(swUrl, location.href).href));
+    const swHref = new URL(swUrl, location.href).href;
+    container.addEventListener("message", (e) => {
+      if (!fromOurWorker(e, swHref)) return;
+      const m: unknown = e.data;
+      if (isSwMessage(m) && m.http4 === "log") {
+        const r: PageRequestReport = { ...m.entry, at: performance.now() };
+        mirror.push(r);
+        if (mirror.length > MIRROR_LIMIT) mirror.shift();
+        for (const l of listeners) l(r);
+        return;
+      }
+      answer(e, opened);
+    });
     // Deliver messages the worker sent before this script ran (they queue until now).
     container.startMessages();
   }
-  const registration = container && register
+  const registration = container && register && !disabled
     ? container.register(swUrl, { scope }).catch(() => null)
     : Promise.resolve(container ? container.getRegistration(scope).then((r) => r ?? null) : null);
 
@@ -48,14 +86,22 @@ export function install(opts: InstallOptions = {}): Http4Page {
     get controlled() {
       return container?.controller != null;
     },
-    report: (r) => askReport(container, r?.all ?? false),
+    disabled,
+    report: (r) => (r?.all ? askReport(container, true) : Promise.resolve(mirror.slice())),
+    onReport(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
   };
 }
 
-/** Answer one message from our worker. Messages from anything else are ignored. */
-function answer(e: MessageEvent, opened: Promise<Opened>, swHref: string): void {
+function fromOurWorker(e: MessageEvent, swHref: string): boolean {
   const src = e.source;
-  if (!(src instanceof ServiceWorker) || src.scriptURL !== swHref) return;
+  return src instanceof ServiceWorker && src.scriptURL === swHref;
+}
+
+/** Answer one request-carrying message from our worker. */
+function answer(e: MessageEvent, opened: Promise<Opened>): void {
   const m: unknown = e.data;
   const port = e.ports[0];
   if (!isSwMessage(m) || !port) return;

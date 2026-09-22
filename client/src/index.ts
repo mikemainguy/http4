@@ -16,7 +16,7 @@ export type { ClientOptions, ClientStats, Http4Response } from "./transport.ts";
 export { prefixMapper } from "./fetcher.ts";
 export type { RequestReport, Transport } from "./fetcher.ts";
 export { install } from "./page.ts";
-export type { Http4Page, InstallOptions } from "./page.ts";
+export type { Http4Page, InstallOptions, PageRequestReport } from "./page.ts";
 export type { SwRequestReport } from "./swproto.ts";
 
 export const DEFAULT_ASSET_PREFIX = "/assets/";
@@ -110,12 +110,43 @@ export async function open(opts: ConnectOptions = {}): Promise<Opened> {
   }
 
   const prefix = pathToAssetId ? undefined : (assetPrefix ?? cfg.assetPrefix ?? DEFAULT_ASSET_PREFIX);
-  const fetcher = new Http4Fetcher(client ?? null, reason, {
+  return build(client, reason, prefix, { baseUrl, pathToAssetId, platformFetch, onRequest, reportLimit });
+}
+
+/**
+ * A fallback-only handle that never opens a session, for a page that turned
+ * HTTP4 off. Internal: the Service Worker bridge uses it.
+ */
+export function openDisabled(reason: string, opts: Pick<ConnectOptions, "baseUrl" | "fetch" | "onRequest" | "reportLimit"> = {}): Opened {
+  const baseUrl = opts.baseUrl ?? globalThis.location?.href;
+  if (!baseUrl) throw new TypeError("http4: no baseUrl and no location to default it from");
+  return build(undefined, reason, undefined, {
     baseUrl,
-    pathToAssetId: pathToAssetId ?? prefixMapper(baseUrl, prefix!),
-    platformFetch,
-    ...(onRequest ? { onRequest } : {}),
-    ...(reportLimit !== undefined ? { reportLimit } : {}),
+    pathToAssetId: () => null,
+    platformFetch: opts.fetch ?? globalThis.fetch.bind(globalThis),
+    onRequest: opts.onRequest,
+    reportLimit: opts.reportLimit,
+  });
+}
+
+function build(
+  client: Http4Client | undefined,
+  reason: string | undefined,
+  prefix: string | undefined,
+  o: {
+    baseUrl: string;
+    pathToAssetId: ((url: URL) => string | null) | undefined;
+    platformFetch: typeof fetch;
+    onRequest: ((r: RequestReport) => void) | undefined;
+    reportLimit: number | undefined;
+  },
+): Opened {
+  const fetcher = new Http4Fetcher(client ?? null, reason, {
+    baseUrl: o.baseUrl,
+    pathToAssetId: o.pathToAssetId ?? prefixMapper(o.baseUrl, prefix!),
+    platformFetch: o.platformFetch,
+    ...(o.onRequest ? { onRequest: o.onRequest } : {}),
+    ...(o.reportLimit !== undefined ? { reportLimit: o.reportLimit } : {}),
   });
   const handle: Http4 = {
     fetch: (input, init) => fetcher.fetch(input, init),

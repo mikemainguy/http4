@@ -3,7 +3,9 @@
 // requests anything below it, and it answers the worker as early as possible.
 // It exposes the page API as window.http4.
 //
-// Optional attributes on the tag: data-config-url, data-asset-prefix.
+// Optional attributes on the tag: data-config-url, data-asset-prefix, and
+// data-disabled (turn HTTP4 off). A page URL with ?http4=off also turns it
+// off, for side-by-side comparisons.
 
 import { install, type Http4Page, type InstallOptions } from "./page.ts";
 
@@ -17,4 +19,7 @@ const tag = document.currentScript as HTMLScriptElement | null;
 const opts: InstallOptions = {};
 if (tag?.dataset.configUrl) opts.configUrl = tag.dataset.configUrl;
 if (tag?.dataset.assetPrefix) opts.assetPrefix = tag.dataset.assetPrefix;
+if (tag?.dataset.disabled !== undefined || new URLSearchParams(location.search).get("http4") === "off") {
+  opts.disabled = true;
+}
 window.http4 = install(opts);
