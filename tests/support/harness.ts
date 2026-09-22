@@ -11,20 +11,37 @@ import { chromium, type Browser } from "playwright-core";
 
 export const root = path.resolve(import.meta.dirname, "../..");
 
+/** GET /metrics.json, mirroring sender.Snapshot in server/internal/sender/metrics.go. */
+export interface ServerMetrics {
+  sessions: number;
+  rpcs: number;
+  packets_in: number;
+  malformed_in: number;
+  data_packets: number;
+  data_bytes: number;
+  resent_bytes: number;
+  errors_sent: number;
+  chunk_shrinks: number;
+  rpcs_evicted: number;
+  ungranted_bytes_sent: number;
+  dropped_data_packets: number;
+}
+
 export interface Harness {
   http: string; // page origin, e.g. http://127.0.0.1:53211
   webtransport: string;
   browser: Browser;
-  metrics(): Promise<Record<string, number>>;
+  metrics(): Promise<ServerMetrics>;
   stop(): Promise<void>;
 }
 
-export async function startHarness(assetsDir: string): Promise<Harness> {
+/** `extraArgs` go to http4d, e.g. ["-drop", "every=7"]. */
+export async function startHarness(assetsDir: string, extraArgs: string[] = []): Promise<Harness> {
   const tmp = mkdtempSync(path.join(tmpdir(), "http4-test-"));
   const bin = path.join(tmp, "http4d");
   execFileSync("go", ["build", "-o", bin, "./cmd/http4d"], { cwd: path.join(root, "server"), stdio: "inherit" });
 
-  const args = ["-http", "127.0.0.1:0", "-wt", "127.0.0.1:0", "-static", path.join(root, "client"), "-assets", assetsDir];
+  const args = ["-http", "127.0.0.1:0", "-wt", "127.0.0.1:0", "-static", path.join(root, "client"), "-assets", assetsDir, ...extraArgs];
   const server = spawn(bin, args, { stdio: ["ignore", "pipe", "inherit"] });
   const stopServer = async () => {
     if (server.exitCode === null && server.signalCode === null) {
@@ -55,7 +72,7 @@ export async function startHarness(assetsDir: string): Promise<Harness> {
     browser,
     async metrics() {
       const res = await fetch(ready.http + "/metrics.json");
-      return (await res.json()) as Record<string, number>;
+      return (await res.json()) as ServerMetrics;
     },
     async stop() {
       await browser.close();

@@ -15,6 +15,7 @@ type Metrics struct {
 	ChunkShrinks  atomic.Int64 // times QUIC refused a datagram as too large
 	RPCsEvicted   atomic.Int64
 	UngrantedSent atomic.Int64 // G2: payload bytes sent past the RPC's grant; must stay 0
+	DroppedData   atomic.Int64 // DATA packets discarded by loss injection (testing only)
 }
 
 // Snapshot is Metrics as plain values, for JSON.
@@ -30,6 +31,7 @@ type Snapshot struct {
 	ChunkShrinks  int64 `json:"chunk_shrinks"`
 	RPCsEvicted   int64 `json:"rpcs_evicted"`
 	UngrantedSent int64 `json:"ungranted_bytes_sent"`
+	DroppedData   int64 `json:"dropped_data_packets"`
 }
 
 func (m *Metrics) Snapshot() Snapshot {
@@ -45,5 +47,6 @@ func (m *Metrics) Snapshot() Snapshot {
 		ChunkShrinks:  m.ChunkShrinks.Load(),
 		RPCsEvicted:   m.RPCsEvicted.Load(),
 		UngrantedSent: m.UngrantedSent.Load(),
+		DroppedData:   m.DroppedData.Load(),
 	}
 }

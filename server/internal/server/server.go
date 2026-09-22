@@ -37,6 +37,7 @@ type Config struct {
 	WTAddr    string // UDP address for WebTransport, e.g. 127.0.0.1:4433
 	StaticDir string // directory served at / (the built client)
 	AssetsDir string // directory HTTP4 REQs are served from
+	DropSpec  string // loss injection for outgoing DATA (sender.ParseDropSpec); testing only
 }
 
 // ClientConfig is served at /config.json so the page never hard-codes the
@@ -66,6 +67,10 @@ type Server struct {
 // a free port; the chosen ports are reflected in HTTPURL and WebTransportURL.
 func Start(cfg Config) (*Server, error) {
 	cert, err := devcert.Generate(time.Now())
+	if err != nil {
+		return nil, err
+	}
+	newDropper, err := sender.ParseDropSpec(cfg.DropSpec)
 	if err != nil {
 		return nil, err
 	}
@@ -107,7 +112,7 @@ func Start(cfg Config) (*Server, error) {
 	}
 	wtMux := http.NewServeMux()
 	wtMux.HandleFunc(WebTransportPath, s.upgrade(func(sess *webtransport.Session) {
-		sender.Serve(sess.Context(), sess, sender.Config{Assets: s.assets, Metrics: s.metrics})
+		sender.Serve(sess.Context(), sess, sender.Config{Assets: s.assets, Metrics: s.metrics, NewDropper: newDropper})
 	}))
 	wtMux.HandleFunc(EchoPath, s.upgrade(echoDatagrams))
 	h3.Handler = wtMux

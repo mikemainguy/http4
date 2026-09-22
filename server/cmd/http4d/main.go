@@ -18,9 +18,10 @@ func main() {
 	wtAddr := flag.String("wt", "127.0.0.1:4433", "UDP address for WebTransport")
 	static := flag.String("static", "client", "directory served at /")
 	assets := flag.String("assets", "testdata/assets", "directory HTTP4 requests are served from")
+	drop := flag.String("drop", "", "TESTING ONLY: drop outgoing DATA to simulate loss, e.g. every=7,packet0,final,rate=0.05,seed=1")
 	flag.Parse()
 
-	srv, err := server.Start(server.Config{HTTPAddr: *httpAddr, WTAddr: *wtAddr, StaticDir: *static, AssetsDir: *assets})
+	srv, err := server.Start(server.Config{HTTPAddr: *httpAddr, WTAddr: *wtAddr, StaticDir: *static, AssetsDir: *assets, DropSpec: *drop})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -32,6 +33,9 @@ func main() {
 		"http":         srv.HTTPURL,
 		"webtransport": srv.WebTransportURL,
 	})
+	if *drop != "" {
+		log.Printf("WARNING: injecting loss on outgoing DATA: %s", *drop)
+	}
 	log.Printf("open %s", srv.HTTPURL)
 
 	sig := make(chan os.Signal, 1)

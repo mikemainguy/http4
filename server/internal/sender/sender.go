@@ -35,6 +35,9 @@ type Config struct {
 	// IdleTimeout evicts an RPC nothing has referred to for this long. The
 	// client can still RESEND until then.
 	IdleTimeout time.Duration
+	// NewDropper, if set, makes a loss-injection hook for each session (see
+	// ParseDropSpec). Testing only.
+	NewDropper func() Dropper
 }
 
 const (
@@ -68,6 +71,9 @@ func Serve(ctx context.Context, conn Conn, cfg Config) {
 		wake:  make(chan struct{}, 1),
 		chunk: wire.MaxPayload(cfg.InitialMaxDatagram),
 		now:   time.Now,
+	}
+	if cfg.NewDropper != nil {
+		s.drop = cfg.NewDropper()
 	}
 	var wg sync.WaitGroup
 	wg.Go(func() {
@@ -105,6 +111,7 @@ type session struct {
 	cfg  Config
 	m    *Metrics
 	now  func() time.Time
+	drop Dropper // nil unless injecting loss; used by the send loop only
 
 	mu      sync.Mutex
 	rpcs    map[wire.RPCID]*rpc
@@ -328,7 +335,10 @@ func (s *session) send(ctx context.Context, w work) bool {
 		log.Printf("BUG: cannot encode %+v: %v", w.pkt, err)
 		return false
 	}
-	if err := s.conn.SendDatagram(b); err != nil {
+	if isData && s.drop != nil && s.drop(w.dropInfo(d)) {
+		// Simulated loss: record it as sent, as if it vanished on the wire.
+		s.m.DroppedData.Add(1)
+	} else if err := s.conn.SendDatagram(b); err != nil {
 		var tooLarge *quic.DatagramTooLargeError
 		if errors.As(err, &tooLarge) && isData {
 			// Nothing was sent and nothing was recorded, so the same work is
@@ -372,6 +382,16 @@ func (s *session) send(ctx context.Context, w work) bool {
 	s.m.DataPackets.Add(1)
 	s.m.DataBytes.Add(int64(len(d.Payload)))
 	return true
+}
+
+func (w work) dropInfo(d *wire.Data) DropInfo {
+	end := d.Offset + uint32(len(d.Payload))
+	return DropInfo{
+		Packet0: d.Offset == 0,
+		Final:   d.TotalSize > 0 && end == d.TotalSize,
+		// Only the send loop writes r.next, and this runs on the send loop.
+		Resend: w.kind == workResend || (w.kind == workPacket0 && w.r.next >= end),
+	}
 }
 
 func (s *session) evictIdle() {

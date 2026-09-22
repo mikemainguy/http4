@@ -56,6 +56,11 @@ export class SrptScheduler {
     if (e) e.received += bytes;
   }
 
+  /** Current grant ceiling for an RPC, or undefined if it isn't scheduled. */
+  granted(rpcId: bigint): number | undefined {
+    return this.rpcs.get(rpcId)?.granted;
+  }
+
   /** Bytes granted to scheduled RPCs but not yet received. */
   outstanding(): number {
     let n = 0;

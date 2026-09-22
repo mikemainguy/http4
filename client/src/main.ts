@@ -2,7 +2,7 @@
 // session. Both are published on window (__echo, __http4) so headless tests
 // can drive and inspect them.
 
-import { Http4Client, type ClientStats } from "./transport.ts";
+import { Http4Client, type ClientOptions, type ClientStats } from "./transport.ts";
 import type { GrantTrace } from "./scheduler.ts";
 
 interface ClientConfig {
@@ -19,6 +19,8 @@ export interface Http4Handle {
   client: Http4Client;
   trace: GrantTrace[];
   stats(): ClientStats;
+  /** Open another session with its own options (tests use it to inject loss). */
+  connect(opts: ClientOptions): Promise<Http4Client>;
 }
 
 declare global {
@@ -106,7 +108,12 @@ async function main(): Promise<void> {
   try {
     const trace: GrantTrace[] = [];
     const client = await Http4Client.connect(cfg.webTransportUrl, hash, { trace });
-    window.__http4 = { client, trace, stats: () => ({ ...client.stats }) };
+    window.__http4 = {
+      client,
+      trace,
+      stats: () => ({ ...client.stats }),
+      connect: (opts) => Http4Client.connect(cfg.webTransportUrl, hash, opts),
+    };
     status.textContent += " · HTTP4 session open";
   } catch (err) {
     window.__http4 = { error: err instanceof Error ? err.message : String(err) };
