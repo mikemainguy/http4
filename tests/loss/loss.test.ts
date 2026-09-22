@@ -3,6 +3,11 @@
 // transfer still completes with the right SHA-256. Recovery must actually have
 // happened (drops counted, RESENDs or REQ retransmits sent), and the server
 // must still send zero un-granted bytes.
+//
+// Speed (vrek iss-e58kfkh): each scenario's concurrent batch is timed as the
+// median of a few fresh sessions, against a lossless baseline measured the
+// same way. With every 7th DATA dropped the batch must finish within 3× the
+// baseline, which needs loss repaired as soon as it shows, not after a stall.
 import { after, before, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import type { Page } from "playwright-core";
@@ -21,10 +26,16 @@ interface Scenario {
   name: string;
   serverDrop?: string; // http4d -drop spec
   clientDrop?: ClientDropSpec;
+  baseline?: boolean; // no loss: the reference batch time
+  maxVsBaseline?: number; // the median batch must be within this × the baseline
 }
 
+const BATCH_RUNS = 3;
+let baselineMs: number | undefined;
+
 const SCENARIOS: Scenario[] = [
-  { name: "server drops every 7th DATA", serverDrop: "every=7" },
+  { name: "no loss (baseline)", baseline: true },
+  { name: "server drops every 7th DATA", serverDrop: "every=7", maxVsBaseline: 3 },
   { name: "server drops each packet 0 and each final chunk once", serverDrop: "packet0,final" },
   { name: "server drops 5% of DATA at random", serverDrop: "rate=0.05,seed=3" },
   { name: "client drops each first REQ and every 3rd GRANT", clientDrop: { firstReq: true, grantEvery: 3 } },
@@ -57,24 +68,43 @@ for (const sc of SCENARIOS) {
         assertIntact(assets, r.results);
         stats.push(r.stats);
       }
-      const all = await fetchInPage(page, names, drop);
-      assertIntact(assets, all.results);
-      stats.push(all.stats);
+      const batches: number[] = [];
+      let all!: Awaited<ReturnType<typeof fetchInPage>>;
+      for (let i = 0; i < BATCH_RUNS; i++) {
+        all = await fetchInPage(page, names, drop);
+        assertIntact(assets, all.results);
+        stats.push(all.stats);
+        batches.push(Math.max(...all.results.map((r) => r.ms)));
+      }
+      batches.sort((a, b) => a - b);
+      const batch = batches[BATCH_RUNS >> 1]!;
 
       const m = await h.metrics();
-      const sum = (k: "recoveries" | "resendsSent" | "reqRetransmits" | "droppedOutgoing" | "duplicateBytesIn") =>
-        stats.reduce((n, s) => n + s[k], 0);
-      const slowest = Math.max(...all.results.map((r) => r.ms));
+      const sum = (k: "recoveries" | "resendsSent" | "earlyResends" | "reqRetransmits" | "droppedOutgoing" | "duplicateBytesIn") =>
+        stats.reduce((n, s) => n + ((s as unknown as Record<string, number>)[k] ?? 0), 0);
       console.log(
         `${sc.name}: server dropped ${m.dropped_data_packets}, resent ${m.resent_bytes} B; ` +
-          `client dropped ${sum("droppedOutgoing")}, recoveries ${sum("recoveries")}, RESENDs ${sum("resendsSent")}, ` +
+          `client dropped ${sum("droppedOutgoing")}, recoveries ${sum("recoveries")}, RESENDs ${sum("resendsSent")} (early ${sum("earlyResends")}), ` +
           `REQ retransmits ${sum("reqRetransmits")}, duplicate bytes ${sum("duplicateBytesIn")}; ` +
-          `concurrent batch ${slowest.toFixed(0)} ms, srtt ${all.stats.srttMs?.toFixed(2)} ms, rto ${all.stats.rtoMs.toFixed(0)} ms`,
+          `concurrent batch median ${batch.toFixed(0)} ms (${batches.map((b) => b.toFixed(0)).join(", ")}), ` +
+          `srtt ${all.stats.srttMs?.toFixed(2)} ms, rto ${all.stats.rtoMs.toFixed(0)} ms`,
       );
 
       assert.equal(m.ungranted_bytes_sent, 0, "server sent un-granted bytes");
+      if (sc.baseline) {
+        baselineMs = batch;
+        assert.equal(sum("duplicateBytesIn"), 0, "duplicate bytes without any loss");
+        return;
+      }
       assert.ok(m.dropped_data_packets + sum("droppedOutgoing") > 0, "scenario injected no loss");
-      assert.ok(sum("recoveries") > 0, "no recovery was needed, so recovery was not tested");
+      assert.ok(sum("recoveries") + sum("earlyResends") > 0, "no recovery was needed, so recovery was not tested");
+      if (sc.maxVsBaseline !== undefined) {
+        assert.ok(baselineMs !== undefined, "baseline scenario did not run first");
+        assert.ok(
+          batch <= sc.maxVsBaseline * baselineMs,
+          `batch ${batch.toFixed(0)} ms is more than ${sc.maxVsBaseline}× the ${baselineMs.toFixed(0)} ms lossless baseline`,
+        );
+      }
     });
   });
 }
