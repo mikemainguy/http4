@@ -1,0 +1,14 @@
+{
+  "name": "http4-client",
+  "version": "0.1.0",
+  "description": "Browser client for HTTP4, a receiver-driven transport over WebTransport datagrams, with transparent fallback to fetch()",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/http4.js"
+    }
+  },
+  "files": ["dist/http4.js", "dist/http4.js.map", "dist/types"],
+  "sideEffects": false
+}

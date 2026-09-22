@@ -45,6 +45,9 @@ type Config struct {
 	// and echo URLs instead of the UDP listener's own address, e.g. an
 	// impairment proxy in front of it. The listener itself is unchanged.
 	AdvertiseWT string
+	// AssetPrefix is the HTTP path the asset pool is also served under, for
+	// clients falling back from HTTP4. Default DefaultAssetPrefix.
+	AssetPrefix string
 }
 
 // ClientConfig is served at /config.json so the page never hard-codes the
@@ -82,6 +85,10 @@ type Server struct {
 func Start(cfg Config) (*Server, error) {
 	cert, err := devcert.Generate(time.Now())
 	if err != nil {
+		return nil, err
+	}
+	assetPrefix := cmp.Or(cfg.AssetPrefix, DefaultAssetPrefix)
+	if err := checkAssetPrefix(assetPrefix); err != nil {
 		return nil, err
 	}
 	newDropper, err := sender.ParseDropSpec(cfg.DropSpec)
@@ -136,6 +143,7 @@ func Start(cfg Config) (*Server, error) {
 	httpMux := http.NewServeMux()
 	httpMux.HandleFunc("/config.json", s.handleConfig)
 	httpMux.HandleFunc("/metrics.json", s.handleMetrics)
+	httpMux.Handle(assetPrefix, http.StripPrefix(assetPrefix, http.HandlerFunc(s.handleAsset)))
 	httpMux.Handle("/", http.FileServer(http.Dir(cfg.StaticDir)))
 	s.httpSrv = &http.Server{Handler: httpMux, ReadHeaderTimeout: 5 * time.Second}
 

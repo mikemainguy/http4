@@ -126,6 +126,7 @@ export class Http4Client {
   private rttvar = 0;
   private ticker: ReturnType<typeof setInterval> | undefined;
   private closed = false;
+  private sessionClosed = false;
 
   private constructor(wt: WebTransport, opts: ClientOptions) {
     this.wt = wt;
@@ -151,13 +152,21 @@ export class Http4Client {
       reqRetransmits: 0, resendsSent: 0, metaIn: 0, recoveries: 0, droppedOutgoing: 0, srttMs: null, rtoMs: this.rto(),
     };
     void this.readLoop();
-    void wt.closed.finally(() => this.failAll(new Http4Error("session closed")));
+    void wt.closed.finally(() => {
+      this.sessionClosed = true;
+      this.failAll(new Http4Error("session closed"));
+    });
   }
 
   static async connect(url: string, certHash?: Uint8Array<ArrayBuffer>, opts: ClientOptions = {}): Promise<Http4Client> {
     const wt = new WebTransport(url, certHash ? { serverCertificateHashes: [{ algorithm: "sha-256", value: certHash }] } : {});
     await wt.ready;
     return new Http4Client(wt, opts);
+  }
+
+  /** False once close() was called or the WebTransport session ended. */
+  get isOpen(): boolean {
+    return !this.closed && !this.sessionClosed;
   }
 
   /** Fetch one asset by ID. Resolves with its bytes. */
@@ -167,7 +176,7 @@ export class Http4Client {
 
   /** Fetch one asset by ID. Resolves with its bytes and metadata. */
   request(assetId: string): Promise<Http4Response> {
-    if (this.closed) return Promise.reject(new Http4Error("client closed"));
+    if (!this.isOpen) return Promise.reject(new Http4Error(this.closed ? "client closed" : "session closed"));
     const rpcId = newRpcId();
     const req: Packet = { type: "REQ", rpcId, initialGrant: this.initialGrant, assetId };
     const size = encode(req).length;
