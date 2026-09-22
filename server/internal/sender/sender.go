@@ -314,6 +314,11 @@ type work struct {
 	kind    workKind
 	packet0 uint64 // for workMeta/workPacket0: the request generation this answers
 	seq     bool   // DATA goes out as DATA_SEQ (decided at pick, so the payload fits)
+	// bulk marks new data from an RPC with more left than QUIC's send queue
+	// holds. Such an RPC is limited by the wire rather than by the queue, so
+	// holding it back costs it nothing it won't get back, and it is the only
+	// thing the pacer ever delays (pacer.go).
+	bulk bool
 }
 
 type workKind int
@@ -337,13 +342,12 @@ func (s *session) sendLoop(ctx context.Context) {
 			s.evictIdle()
 		default:
 		}
-		if !s.pace(ctx) {
-			return
-		}
 		s.mu.Lock()
 		w, ok := s.pick()
 		s.mu.Unlock()
 		if !ok {
+			// Out of work: the wire is no longer ours to measure.
+			s.pacer.idle()
 			select {
 			case <-ctx.Done():
 				return
@@ -353,35 +357,38 @@ func (s *session) sendLoop(ctx context.Context) {
 			}
 			continue
 		}
+		if w.bulk {
+			if d := s.pacer.wait(s.now()); d > 0 {
+				if !s.hold(ctx, d) {
+					return
+				}
+				continue // re-pick: something more urgent may have arrived meanwhile
+			}
+		}
 		if !s.send(ctx, w) {
 			return
 		}
 	}
 }
 
-// pace holds off until QUIC's send queue is shallow enough that the packet
-// picked next won't sit behind bulk queued earlier. It returns false once the
-// session is over. A wake re-checks rather than waiting the estimate out: by
-// then the queue has often drained already.
-func (s *session) pace(ctx context.Context) bool {
-	for {
-		d := s.pacer.wait(s.now())
-		if d <= 0 {
-			return true
-		}
-		s.m.PacedWaits.Add(1)
-		start := s.now()
-		timer := time.NewTimer(d)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return false
-		case <-timer.C:
-		case <-s.wake:
-			timer.Stop()
-		}
-		s.m.PacedWaitMicros.Add(s.now().Sub(start).Microseconds())
+// hold waits d for QUIC's send queue to drain, so the bulk datagram just
+// picked doesn't deepen a queue that a small reply may have to depart behind.
+// It returns false once the session is over. A wake cuts the wait short: the
+// caller re-picks, and a packet that became due meanwhile goes out first.
+func (s *session) hold(ctx context.Context, d time.Duration) bool {
+	s.m.PacedWaits.Add(1)
+	start := s.now()
+	timer := time.NewTimer(d)
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+		return false
+	case <-timer.C:
+	case <-s.wake:
+		timer.Stop()
 	}
+	s.m.PacedWaitMicros.Add(s.now().Sub(start).Microseconds())
+	return true
 }
 
 // pick chooses the next packet. Order: control replies, then META, then
@@ -422,7 +429,8 @@ func (s *session) pick() (work, bool) {
 		return work{pkt: r.data(sp.start, n), r: r, kind: workResend, seq: seq}, true
 	default:
 		n := min(chunk, r.granted-r.next)
-		return work{pkt: r.data(r.next, n), r: r, kind: workNew, seq: seq}, true
+		bulk := r.size-r.next > quicSendQueue*chunk
+		return work{pkt: r.data(r.next, n), r: r, kind: workNew, seq: seq, bulk: bulk}, true
 	}
 }
 

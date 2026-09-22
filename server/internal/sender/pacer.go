@@ -25,6 +25,11 @@ const (
 	// datagram every ~7 ms (vrek iss-dy53a59).
 	pacerSample   = 200 * time.Millisecond
 	pacerMinSends = 16
+	// pacerMaxWait caps one hold-off. The depth estimate is a belief, and a
+	// belief nothing refutes while it is being acted on is how a sender stalls
+	// itself: past the cap it sends anyway, and the send says whether the queue
+	// really was full.
+	pacerMaxWait = 50 * time.Millisecond
 	// When the queue looks empty the pacer, not the wire, is the bottleneck, so
 	// the estimate is nudged faster by pacerProbeNum / pacerProbeDen, at most
 	// once per pacerProbeEvery. Tying it to an empty queue is what keeps it
@@ -58,6 +63,12 @@ const (
 // empties the queue, which is the only case where pacing costs throughput, and
 // that is exactly when probing nudges it faster.
 //
+// Only bulk is ever held back (work.bulk): an RPC with more left than the queue
+// holds is limited by the wire, so the wait costs it nothing, while a small
+// reply is mostly queueing delay and is never made to wait. Holding everything
+// back instead throttles a sender that has only small replies to send to below
+// its own offered load, which cost a benchmark run to learn.
+//
 // Pure logic with the clock passed in, so it can be tested without a network.
 type pacer struct {
 	target   int           // datagrams allowed to sit in the queue
@@ -70,9 +81,10 @@ type pacer struct {
 	probeAt time.Time // when the interval was last nudged
 }
 
-// wait reports how long to hold off before handing quic-go another datagram.
-// The send loop waits *before* picking, so the wait ends with a fresh choice:
-// a packet that becomes due while waiting goes out first.
+// wait reports how long to hold off before handing quic-go another bulk
+// datagram. The send loop re-picks afterwards, so a packet that becomes due
+// while it waits goes out first — and only bulk ever waits, because delaying
+// the most urgent packet there is helps nobody.
 func (p *pacer) wait(now time.Time) time.Duration {
 	if p.target < 0 {
 		return 0 // pacing off: the queue runs as deep as QUIC allows
@@ -86,7 +98,15 @@ func (p *pacer) wait(now time.Time) time.Duration {
 		return 0
 	}
 	// Hold off for the departures that bring the queue back under target.
-	return time.Duration((over + 1) * float64(p.interval))
+	return min(time.Duration((over+1)*float64(p.interval)), pacerMaxWait)
+}
+
+// idle records that the send loop ran out of work. Datagrams kept leaving while
+// it had none to add, so a sample spanning this moment would measure what the
+// sender happened to offer rather than what the wire can carry, and pacing to
+// an offered load throttles the sender to below it.
+func (p *pacer) idle() {
+	p.since, p.sends = time.Time{}, 0
 }
 
 // sent records one datagram handed to quic-go, and whether that blocked.

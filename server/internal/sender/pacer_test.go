@@ -1,6 +1,7 @@
 package sender
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -52,14 +53,17 @@ func TestPacerMeasuresTheWireAndDrainsAFullQueue(t *testing.T) {
 	if got := p.interval; got < 3800*time.Microsecond || got > 4200*time.Microsecond {
 		t.Errorf("measured interval %v, want ≈ %v", got, interval)
 	}
-	// The last send blocked, so the queue is full: the wait must cover the
-	// departures that bring it back under target.
-	want := time.Duration((quicSendQueue - 4 + 1) * interval) // 29 × 4 ms
-	if d := p.wait(at); d < want-interval || d > want+interval {
-		t.Errorf("wait = %v after a full queue, want ≈ %v", d, want)
+	// The last send blocked, so the queue is full: it holds off, one capped
+	// wait at a time, until enough datagrams have departed.
+	drain := time.Duration((quicSendQueue - 4 + 1) * interval) // 29 × 4 ms
+	if d := p.wait(at); d != pacerMaxWait {
+		t.Errorf("wait = %v after a full queue, want the %v cap", d, pacerMaxWait)
+	}
+	if d := p.wait(at.Add(pacerMaxWait)); d <= 0 {
+		t.Errorf("wait = %v partway through the drain, want it to keep holding off", d)
 	}
 	// Once those departures have happened, it stops holding off.
-	if d := p.wait(at.Add(want)); d != 0 {
+	if d := p.wait(at.Add(drain)); d != 0 {
 		t.Errorf("wait = %v after the queue drained, want 0", d)
 	}
 }
@@ -252,6 +256,46 @@ func bulkAhead(t *testing.T, target int, interval time.Duration) int {
 		case <-deadline:
 			t.Fatalf("the small reply never came; %d bulk datagrams departed", n)
 		}
+	}
+}
+
+// The other half of it, and what a 7 s p90 in the benchmark looked like: a
+// session with nothing but small replies must not be held back at all. They
+// are what the pacer exists to protect, and making them wait throttles the
+// sender below its own offered load for no benefit at all.
+func TestSmallRepliesAreNeverHeldBack(t *testing.T) {
+	const interval = 2 * time.Millisecond
+	const n = 150
+
+	elapsed := func(target int) time.Duration {
+		assets := MapAssets{}
+		for i := range n {
+			assets[fmt.Sprintf("a%d", i)] = asset(900)
+		}
+		h := start(t, assets, func(c *Config) { c.SendQueueTarget = target })
+		h.queueDatagrams(interval)
+		t0 := time.Now()
+		for i := range n {
+			h.send(&wire.Req{RPCID: wire.RPCID(i + 1), InitialGrant: 900, AssetID: fmt.Sprintf("a%d", i)})
+		}
+		for got := 0; got < n; {
+			select {
+			case p := <-h.out:
+				switch p.(type) {
+				case *wire.Data, *wire.DataSeq:
+					got++
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatalf("only %d of %d replies arrived", got, n)
+			}
+		}
+		return time.Since(t0)
+	}
+
+	unpaced, paced := elapsed(-1), elapsed(DefaultSendQueueTarget)
+	t.Logf("%d small replies took %v unpaced, %v paced", n, unpaced, paced)
+	if paced > unpaced*5/4 {
+		t.Errorf("pacing made %d small replies take %v against %v unpaced: it is throttling the traffic it exists to protect", n, paced, unpaced)
 	}
 }
 
