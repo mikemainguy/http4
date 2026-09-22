@@ -1,9 +1,10 @@
-// Scaffold client: connect to the sandbox server over WebTransport and bounce
-// one datagram off it. The result is rendered and also published on
-// window.__echo so the headless acceptance test can read it.
+// Scaffold client: connect to the sandbox server's echo endpoint over
+// WebTransport and bounce one datagram off it. The result is rendered and
+// also published on window.__echo so the headless acceptance test can read it.
 
 interface ClientConfig {
-  webTransportUrl: string;
+  webTransportUrl: string; // HTTP4
+  echoUrl: string; // datagram echo, a connectivity check
   certHash: string; // base64 SHA-256 of the server certificate DER
 }
 
@@ -28,7 +29,7 @@ async function connect(): Promise<WebTransport> {
   const res = await fetch("/config.json", { cache: "no-store" });
   if (!res.ok) throw new Error(`GET /config.json: ${res.status}`);
   const cfg = (await res.json()) as ClientConfig;
-  const wt = new WebTransport(cfg.webTransportUrl, {
+  const wt = new WebTransport(cfg.echoUrl, {
     serverCertificateHashes: [{ algorithm: "sha-256", value: base64ToBytes(cfg.certHash) }],
   });
   await wt.ready;

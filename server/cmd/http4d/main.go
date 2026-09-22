@@ -17,9 +17,10 @@ func main() {
 	httpAddr := flag.String("http", "127.0.0.1:8080", "TCP address serving the client page and /config.json")
 	wtAddr := flag.String("wt", "127.0.0.1:4433", "UDP address for WebTransport")
 	static := flag.String("static", "client", "directory served at /")
+	assets := flag.String("assets", "testdata/assets", "directory HTTP4 requests are served from")
 	flag.Parse()
 
-	srv, err := server.Start(server.Config{HTTPAddr: *httpAddr, WTAddr: *wtAddr, StaticDir: *static})
+	srv, err := server.Start(server.Config{HTTPAddr: *httpAddr, WTAddr: *wtAddr, StaticDir: *static, AssetsDir: *assets})
 	if err != nil {
 		log.Fatal(err)
 	}

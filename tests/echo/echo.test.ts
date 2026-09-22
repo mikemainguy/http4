@@ -4,7 +4,7 @@
 // is left running afterwards.
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -30,7 +30,10 @@ before(async () => {
   const bin = path.join(tmp, "http4d");
   execFileSync("go", ["build", "-o", bin, "./cmd/http4d"], { cwd: path.join(root, "server"), stdio: "inherit" });
 
-  server = spawn(bin, ["-http", "127.0.0.1:0", "-wt", "127.0.0.1:0", "-static", path.join(root, "client")], {
+  const assets = path.join(tmp, "assets"); // empty: this test only uses the echo endpoint
+  mkdirSync(assets);
+  const args = ["-http", "127.0.0.1:0", "-wt", "127.0.0.1:0", "-static", path.join(root, "client"), "-assets", assets];
+  server = spawn(bin, args, {
     stdio: ["ignore", "pipe", "inherit"],
   });
   const [line] = (await Promise.race([
