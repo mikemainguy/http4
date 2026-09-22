@@ -12,11 +12,17 @@
 // fixture pool (scripts/gen-fixtures) is fetched one asset at a time, then all
 // at once, as in the integrity suite.
 //
-// Each cell has a deadline; anything unfinished by then fails with a reason
-// (see cellDeadlineMs for the formula). The whole run is also capped
-// (--max-total-s): cells that can't start in time are reported as skipped and
-// fail. The result goes to stdout as one JSON object; progress goes to stderr.
-// Exits 1 unless every cell passes.
+// G5 is a correctness score (dec-smr579z): each cell's deadline is a
+// hang guard, not a speed target (see cellDeadlineMs). Anything unfinished by
+// then fails with a reason. Speed under loss is measured separately, against
+// HTTP/3 on the same path. The whole run is also capped (--max-total-s,
+// default 3 h): a cell starts only if at least MIN_CELL_MS of the budget is
+// left, and its deadline is clamped to what remains; cells that can't start
+// are reported as skipped and fail. Lossy high-RTT cells are genuinely slow
+// (QUIC's loss-based congestion control, fnd-sp6a32v), so a full-pool run takes
+// on the order of an hour; use --max-size for quick runs. The result goes to
+// stdout as one JSON object; progress goes to stderr. Exits 1 unless every
+// cell passes.
 //
 //   npm run matrix [-- --out results.json] [--cells 0x0,1x50] [--max-size BYTES] [--max-total-s S]
 //
@@ -25,7 +31,7 @@
 import { writeFileSync } from "node:fs";
 import { startHarness, type ImpairStats, type ServerMetrics } from "../support/harness.ts";
 import { openPage } from "../support/page.ts";
-import { ensureFixtures, fetchBy, FIXTURES, Judge, log, type Failure, type Manifest } from "../support/suite.ts";
+import { cellDeadlineMs, ensureFixtures, fetchBy, FIXTURES, Judge, log, type Failure, type Manifest } from "../support/suite.ts";
 import type { ClientStats } from "../../client/src/transport.ts";
 
 const LOSSES = [0, 1, 5]; // % per direction
@@ -54,26 +60,7 @@ interface CellResult extends Cell {
 
 const cellName = (c: Cell) => `${c.lossPct}x${c.rttMs}`;
 
-/**
- * Deadline for one cell, covering both passes (single, then concurrent):
- *
- *   30 s + (2 × bytes ÷ 4 MiB/s) × (1 + 20 × loss) + fetches × RTT × 8
- *
- * - 2 × bytes ÷ 4 MiB/s: both passes at a conservative rate. With BDP-sized
- *   grants the client moves ~40 MiB/s at 150 ms on a clean path (fnd-bcd98yb),
- *   so a clean cell has ~10× headroom.
- * - × (1 + 20 × loss): loss recovery allowance, 2× at 5% loss.
- * - fetches × RTT × 8: per-request round trips (REQ, META + packet 0, grants,
- *   resends), generous for each of the 2 × N fetches.
- * - 30 s: browser start, session setup and slack.
- *
- * With the full 61.1 MiB pool: 0x0 → ~61 s, 0x150 → ~64 s, 5x150 → ~125 s.
- */
-function cellDeadlineMs(c: Cell, bytes: number, fetches: number): number {
-  const rate = 4 * 2 ** 20; // bytes/s
-  const transfer = ((2 * bytes) / rate) * (1 + 20 * (c.lossPct / 100));
-  return 1000 * (30 + transfer + (fetches * c.rttMs * 8) / 1000);
-}
+const MIN_CELL_MS = 60_000; // don't start a cell with less of the total budget left
 
 async function runCell(manifest: Manifest, c: Cell, seed: number, deadlineMs: number): Promise<CellResult> {
   const deadlineS = deadlineMs / 1000;
@@ -174,7 +161,7 @@ function parseArgs(argv: string[]) {
     out: get("--out"),
     cells,
     maxSize: maxSize === undefined ? Infinity : Number(maxSize),
-    maxTotalMs: 1000 * Number(get("--max-total-s") ?? 1800),
+    maxTotalMs: 1000 * Number(get("--max-total-s") ?? 3 * 3600),
   };
 }
 
@@ -190,9 +177,9 @@ async function main(): Promise<number> {
   const runStart = performance.now();
   const cells: CellResult[] = [];
   for (const [i, c] of args.cells.entries()) {
-    const deadlineMs = cellDeadlineMs(c, bytes, fetches);
     const left = args.maxTotalMs - (performance.now() - runStart);
-    if (left < deadlineMs) {
+    const deadlineMs = Math.min(cellDeadlineMs(c, bytes, fetches), left);
+    if (left < MIN_CELL_MS) {
       log(`cell ${cellName(c)}: skipped, total cap (${args.maxTotalMs / 1000} s) would be exceeded`);
       cells.push(skippedCell(manifest, c, `total runtime cap (${args.maxTotalMs / 1000} s) reached before this cell`));
       continue;

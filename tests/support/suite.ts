@@ -81,3 +81,34 @@ export class Judge {
     }
   }
 }
+
+const MSS = 1200; // bytes per QUIC packet, for the matrix congestion model
+
+/**
+ * Hang guard for one cell, covering both passes (single, then concurrent).
+ * It bounds a broken or stuck transfer; it is deliberately far above the
+ * time an honest transfer needs, because G5 scores correctness, not speed:
+ *
+ *   30 s + 3 × (2 × bytes ÷ modelRate) + fetches × RTT × 8
+ *
+ * - modelRate: what QUIC's loss-based congestion control can deliver on this
+ *   path, from the standard steady-state model (Mathis et al.):
+ *   MSS ÷ RTT × 1.22 ÷ √loss, with MSS = 1200 B, capped at 4 MiB/s. A clean
+ *   cell uses the cap. That puts 1%×50 ms at ~0.29 MB/s, while HTTP4 measured
+ *   ~0.55 MB/s there (fnd-sp6a32v), so the model is conservative.
+ * - × 3: margin over the model.
+ * - fetches × RTT × 8: per-request round trips (REQ, META + packet 0, grants,
+ *   resends), generous for each of the 2 × N fetches.
+ * - 30 s: browser start, session setup and slack.
+ *
+ * With the full 61.1 MiB pool: clean cells → ~125 s; 1x50 → ~22 min;
+ * 1x150 → ~66 min; 5x150 → ~2.4 h (a guard only; honest runs finish far sooner).
+ */
+export function cellDeadlineMs(c: { lossPct: number; rttMs: number }, bytes: number, fetches: number): number {
+  const cap = 4 * 2 ** 20; // bytes/s
+  const p = c.lossPct / 100;
+  const rttS = Math.max(c.rttMs, 1) / 1000;
+  const modelRate = p > 0 ? Math.min(cap, (MSS / rttS) * (1.22 / Math.sqrt(p))) : cap;
+  const transfer = 3 * ((2 * bytes) / modelRate);
+  return 1000 * (30 + transfer + (fetches * c.rttMs * 8) / 1000);
+}
