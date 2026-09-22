@@ -42,7 +42,7 @@ func main() {
 	assetPrefix := flag.String("asset-prefix", server.DefaultAssetPrefix, "HTTP path the asset pool is also served under, for clients falling back from HTTP4")
 	advertiseWT := flag.String("advertise-wt", "", "host:port to advertise for WebTransport instead of -wt's, e.g. an impairment proxy in front of it")
 	noSeq := flag.Bool("no-seq", false, "don't negotiate session sequence numbers (wire v2); send plain v1 DATA to every client")
-	sendQueue := flag.Int("send-queue", 0, "datagrams left in QUIC's send queue ahead of the sender's next pick (0 = default, negative = don't pace)")
+	sendQueue := flag.Int("send-queue", 0, "datagrams of bulk to leave in QUIC's send queue ahead of the sender's next pick; 0 or negative = don't pace")
 	flag.Parse()
 
 	run(server.Config{

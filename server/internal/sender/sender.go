@@ -45,10 +45,11 @@ type Config struct {
 	// NoSeq ignores the client's HELLO, so sessions keep plain v1 DATA even
 	// when the client offers session sequence numbers.
 	NoSeq bool
-	// SendQueueTarget is how many datagrams the sender leaves sitting in
-	// QUIC's send queue ahead of the packet it picks next: 0 takes
-	// DefaultSendQueueTarget, and a negative value turns pacing off, letting
-	// the queue run as deep as QUIC allows (see pacer.go).
+	// SendQueueTarget is how many datagrams the sender leaves sitting in QUIC's
+	// send queue ahead of the packet it picks next: 0 takes
+	// DefaultSendQueueTarget, which is off, and any negative value is off too,
+	// letting the queue run as deep as QUIC allows. A positive k paces, which
+	// trades bulk throughput for small-reply latency under loss (see pacer.go).
 	SendQueueTarget int
 }
 

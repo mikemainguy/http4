@@ -47,8 +47,8 @@ type Config struct {
 	DropSpec  string // loss injection for outgoing DATA (sender.ParseDropSpec); testing only
 	NoSeq     bool   // ignore clients' HELLO: plain v1 DATA only (sender.Config.NoSeq)
 	// SendQueueTarget is how many datagrams the sender leaves in QUIC's send
-	// queue ahead of its next pick: 0 takes sender.DefaultSendQueueTarget, and a
-	// negative value turns pacing off (sender.Config.SendQueueTarget).
+	// queue ahead of its next pick. 0 and negative values leave pacing off; a
+	// positive k paces bulk (sender.Config.SendQueueTarget).
 	SendQueueTarget int
 	// AdvertiseWT, if set, is the host:port put in the advertised WebTransport
 	// and echo URLs instead of the UDP listener's own address, e.g. an

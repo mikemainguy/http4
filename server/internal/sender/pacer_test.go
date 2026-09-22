@@ -302,7 +302,7 @@ func TestSmallRepliesAreNeverHeldBack(t *testing.T) {
 		return time.Since(t0)
 	}
 
-	unpaced, paced := elapsed(-1), elapsed(DefaultSendQueueTarget)
+	unpaced, paced := elapsed(-1), elapsed(PacedSendQueueTarget)
 	t.Logf("%d small replies took %v unpaced, %v paced", n, unpaced, paced)
 	if paced > unpaced*5/4 {
 		t.Errorf("pacing made %d small replies take %v against %v unpaced: it is throttling the traffic it exists to protect", n, paced, unpaced)
@@ -316,14 +316,14 @@ func TestSmallReplyDoesNotDepartBehindAFullQueueOfBulk(t *testing.T) {
 	const interval = 5 * time.Millisecond // 32 queued datagrams = 160 ms of wire
 
 	unpaced := bulkAhead(t, -1, interval)
-	paced := bulkAhead(t, DefaultSendQueueTarget, interval)
+	paced := bulkAhead(t, PacedSendQueueTarget, interval)
 	t.Logf("bulk datagrams ahead of the small reply: %d unpaced, %d paced", unpaced, paced)
 
 	if unpaced < quicSendQueue*2/3 {
 		t.Errorf("unpaced, only %d bulk datagrams preceded the small reply; expected a nearly full queue (%d)", unpaced, quicSendQueue)
 	}
 	// The target, plus whatever slack the timer's error leaves in the credit.
-	if want := DefaultSendQueueTarget * 3; paced > want {
+	if want := PacedSendQueueTarget * 3; paced > want {
 		t.Errorf("paced, %d bulk datagrams preceded the small reply, want ≤ %d", paced, want)
 	}
 }

@@ -59,7 +59,7 @@ func parseServe(args []string, out io.Writer) (server.Config, error) {
 	drop := fs.String("drop", "", "drop outgoing DATA to simulate loss: a `spec` like every=7,packet0,final,rate=0.05,seed=1")
 	advertiseWT := fs.String("advertise-wt", "", "advertise this `host:port` for WebTransport, e.g. an impairment proxy")
 	noSeq := fs.Bool("no-seq", false, "don't negotiate session sequence numbers (wire v2); send plain v1 DATA to every client")
-	sendQueue := fs.Int("send-queue", 0, "datagrams left in QUIC's send queue ahead of the sender's next pick (0 = default, negative = don't pace)")
+	sendQueue := fs.Int("send-queue", 0, "datagrams of bulk to leave in QUIC's send queue ahead of the sender's next pick; 0 or negative = don't pace")
 	fs.Usage = func() {
 		fmt.Fprint(out, serveUsage, "\nFlags:\n")
 		printFlags(fs, out, false)

@@ -7,10 +7,18 @@ import "time"
 const quicSendQueue = 32
 
 const (
-	// DefaultSendQueueTarget is how many datagrams may go out back to back
-	// after a pause, and so about how many the sender leaves sitting in QUIC's
-	// send queue ahead of the packet it picks next.
-	DefaultSendQueueTarget = 4
+	// DefaultSendQueueTarget leaves pacing off. It buys a much better small-reply
+	// median under loss and costs about a third of bulk throughput, and it makes
+	// the p99 — which is what G3 scores — no better and at the shallow end
+	// worse, so it is not a default anyone should get without asking. Set it to
+	// a positive k (http4d -send-queue) to pace, and see the trade-off curve in
+	// vrek iss-dy53a59.
+	DefaultSendQueueTarget = -1
+	// PacedSendQueueTarget is the k to use when pacing is asked for: how many
+	// datagrams may go out back to back after a pause, and so about how many the
+	// sender leaves sitting in QUIC's send queue ahead of the packet it picks
+	// next.
+	PacedSendQueueTarget = 4
 	// pacerMinInterval is the departure interval below which pacing is not
 	// worth it: a full queue then drains in under ~8 ms, less than the timer
 	// granularity pacing would spend on it.
@@ -34,14 +42,19 @@ const (
 	// pacerMaxWait caps one wait, so a wake can be noticed and the estimate
 	// re-checked. It does not shorten a hold-off: the loop waits again.
 	pacerMaxWait = 50 * time.Millisecond
-	// pacerBlockedQuarters is how much of a sample window must have blocked for
-	// the sample to count, in quarters of its sends. A sample taken while the
-	// queue was sometimes empty measures what the sender offered rather than
-	// what the wire can carry, and pacing to that offers less still — the
-	// estimate walks itself down and takes the throughput with it. Blocking
-	// often is the sender's only evidence that the wire, and not the sender,
-	// set the pace.
-	pacerBlockedQuarters = 1
+	// pacerBlockedPct is how much of a sample window must have blocked for the
+	// sample to count. A window the sender paced rather than the wire measures
+	// what the sender offered, and pacing to that offers less still.
+	pacerBlockedPct = 10
+	// pacerRateWindow is how long a sample stands. Within it the *slowest*
+	// sample wins, because the two ways a sample lies are not symmetric: a
+	// blocked send is only recognised by how long it took, and on a loaded host
+	// an ordinary send can take as long as a real wait for a departure, so a
+	// window can begin or end when the queue was not in fact full. That
+	// miscounts sends against the departures they are meant to equal, and only
+	// ever counts too many, which makes the wire look faster than it is. The
+	// slowest sample is the one least contaminated that way.
+	pacerRateWindow = 5 * time.Second
 	// pacerHeadroom is the fraction of the wire the sender leaves unused, as a
 	// divisor. Pacing at exactly the measured rate conserves the queue's depth
 	// rather than reducing it: as many datagrams arrive as leave, so a queue
@@ -101,6 +114,7 @@ type pacer struct {
 	sends    int       // datagrams handed over since then, which is how many left
 	blocks   int       // how many of those blocked, which says who set the pace
 	blockRun int       // blocked sends in a row; one alone may just be a slow send
+	worstAt  time.Time // when the interval in force was sampled
 }
 
 // wait reports how long to hold off before handing quic-go another bulk
@@ -146,8 +160,8 @@ func (p *pacer) sent(now time.Time, blocked bool) {
 	// The queue was full then and is full now, so p.sends datagrams left in
 	// between. Long samples only: a short one measures a burst, not the wire.
 	if d := now.Sub(p.since); d >= pacerSample && p.sends >= pacerMinSends {
-		if 4*p.blocks >= pacerBlockedQuarters*p.sends {
-			p.observe(d / time.Duration(p.sends))
+		if 100*p.blocks >= pacerBlockedPct*p.sends {
+			p.observe(now, d/time.Duration(p.sends))
 		}
 		p.since, p.sends, p.blocks = now, 0, 0
 	}
@@ -176,13 +190,13 @@ func (p *pacer) schedule(now time.Time) {
 	p.next = p.next.Add(slot)
 }
 
-// observe folds one departure-interval sample into the estimate.
-func (p *pacer) observe(sample time.Duration) {
-	switch {
-	case sample <= 0:
-	case p.interval <= 0:
-		p.interval = sample
-	default:
-		p.interval = (3*p.interval + sample) / 4 // EWMA, α = ¼
+// observe takes one departure-interval sample. The slowest in the last
+// pacerRateWindow stands, and one older than that is replaced whatever it says.
+func (p *pacer) observe(now time.Time, sample time.Duration) {
+	if sample <= 0 {
+		return
+	}
+	if p.interval <= 0 || sample > p.interval || now.Sub(p.worstAt) > pacerRateWindow {
+		p.interval, p.worstAt = sample, now
 	}
 }
