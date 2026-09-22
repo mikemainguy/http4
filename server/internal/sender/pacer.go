@@ -17,10 +17,14 @@ const (
 	// pacerBlocked is how slow a SendDatagram has to be to mean "the queue was
 	// full". An enqueue that finds room takes microseconds.
 	pacerBlocked = 250 * time.Microsecond
-	// pacerWindow is how many blocked sends make one departure-rate sample.
-	// quic-go pops several datagrams into one packet, so single spacings are
-	// bursty where their rate is not.
-	pacerWindow = 16
+	// A departure-rate sample spans at least pacerSample and pacerMinSends, so
+	// it averages over several congestion bursts. Measured burst by burst the
+	// rate is wildly wrong: on a 1% / 50 ms path quic-go pops a window's worth
+	// of datagrams in a few hundred microseconds and then waits an RTT, so
+	// consecutive blocked sends are ~250 µs apart on a wire carrying one
+	// datagram every ~7 ms (vrek iss-dy53a59).
+	pacerSample   = 200 * time.Millisecond
+	pacerMinSends = 16
 	// When the queue looks empty the pacer, not the wire, is the bottleneck, so
 	// the estimate is nudged faster by pacerProbeNum / pacerProbeDen, at most
 	// once per pacerProbeEvery. Tying it to an empty queue is what keeps it
@@ -41,9 +45,12 @@ const (
 // delay for a small reply granted now.
 //
 // Nothing reports "this datagram left", so the depth is inferred:
-//   - While the queue is full, every send blocks until one datagram leaves, so
-//     a run of blocked sends is a departure clock, and its rate is the wire's.
-//     That is also the only moment the depth is known exactly: it is 32.
+//   - A send that blocks waited for a datagram to leave, so at that instant the
+//     queue is full: the depth is known exactly, and it is 32.
+//   - Between two blocked sends the depth therefore starts and ends at 32, so
+//     however bursty the wire was in between, exactly as many datagrams left as
+//     were handed over. Counting sends between two blocks, over a span long
+//     enough to cover several bursts, measures the departure rate.
 //   - Between departures the depth is dead-reckoned from that rate.
 //
 // The estimate is self-correcting in both directions. Too fast fills the queue,
@@ -58,9 +65,9 @@ type pacer struct {
 	depth    float64       // estimated datagrams queued
 	at       time.Time     // when depth was last brought up to date
 
-	runStart time.Time // first blocked send of the current run
-	runCount int       // blocked sends in it
-	probeAt  time.Time // when the interval was last nudged
+	since   time.Time // the blocked send the current sample counts from
+	sends   int       // datagrams handed over since then, which is how many left
+	probeAt time.Time // when the interval was last nudged
 }
 
 // wait reports how long to hold off before handing quic-go another datagram.
@@ -86,8 +93,8 @@ func (p *pacer) wait(now time.Time) time.Duration {
 func (p *pacer) sent(now time.Time, blocked bool) {
 	p.advance(now)
 	p.depth++
+	p.sends++
 	if !blocked {
-		p.runStart, p.runCount = time.Time{}, 0
 		p.probe(now)
 		return
 	}
@@ -95,14 +102,15 @@ func (p *pacer) sent(now time.Time, blocked bool) {
 	// the depth is exactly the queue length again.
 	p.depth = quicSendQueue
 	p.at = now
-	if p.runCount == 0 {
-		p.runStart, p.runCount = now, 1
+	if p.since.IsZero() {
+		p.since, p.sends = now, 0
 		return
 	}
-	p.runCount++
-	if p.runCount >= pacerWindow {
-		p.observe(now.Sub(p.runStart) / time.Duration(p.runCount-1))
-		p.runStart, p.runCount = now, 1
+	// The queue was full then and is full now, so p.sends datagrams left in
+	// between. Long samples only: a short one measures a burst, not the wire.
+	if d := now.Sub(p.since); d >= pacerSample && p.sends >= pacerMinSends {
+		p.observe(d / time.Duration(p.sends))
+		p.since, p.sends = now, 0
 	}
 }
 

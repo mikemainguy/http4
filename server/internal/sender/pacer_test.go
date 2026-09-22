@@ -35,7 +35,7 @@ func TestPacerLeavesFastPathsAlone(t *testing.T) {
 	p := &pacer{target: 4}
 	// A loopback-ish wire: 32 queued datagrams drain in ~2 ms, so pacing them
 	// would cost more in timer granularity than the delay it saves.
-	at := saturate(p, epoch, 60*time.Microsecond, 64)
+	at := saturate(p, epoch, 60*time.Microsecond, 8192)
 	if p.interval >= pacerMinInterval {
 		t.Fatalf("interval %v, want < %v for this test", p.interval, pacerMinInterval)
 	}
@@ -61,6 +61,25 @@ func TestPacerMeasuresTheWireAndDrainsAFullQueue(t *testing.T) {
 	// Once those departures have happened, it stops holding off.
 	if d := p.wait(at.Add(want)); d != 0 {
 		t.Errorf("wait = %v after the queue drained, want 0", d)
+	}
+}
+
+// The mistake this cost a benchmark run to find: on a congestion-controlled
+// path nothing leaves for an RTT and then a window's worth pops at once, so
+// the spacing between two blocked sends is the burst's, not the wire's.
+func TestPacerMeasuresTheSustainedRateNotTheBurst(t *testing.T) {
+	const burst = 8
+	const gap = 50 * time.Millisecond     // an RTT with nothing leaving
+	const within = 200 * time.Microsecond // spacing inside a burst
+
+	p := &pacer{target: 4}
+	at := epoch
+	for range 20 { // a second of bursts
+		at = saturate(p, at.Add(gap), within, burst)
+	}
+	want := (gap + burst*within) / burst // ~6.4 ms, not 200 µs
+	if p.interval < want*4/5 || p.interval > want*6/5 {
+		t.Errorf("interval %v, want ≈ %v: the wire's rate, not the %v burst spacing", p.interval, want, within)
 	}
 }
 
@@ -204,8 +223,9 @@ func bulkAhead(t *testing.T, target int, interval time.Duration) int {
 	h.queueDatagrams(interval)
 	h.send(&wire.Req{RPCID: 1, InitialGrant: 1 << 20, AssetID: "bulk"})
 
-	// Long enough to fill the queue and for the pacer to measure the wire.
-	time.Sleep(300 * time.Millisecond)
+	// Long enough to fill the queue, for the pacer to measure the wire (a
+	// sample spans pacerSample) and for the queue to drain to the target.
+	time.Sleep(pacerSample + 500*time.Millisecond)
 	for len(h.out) > 0 { // what has already departed is ahead of nothing
 		<-h.out
 	}
