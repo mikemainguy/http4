@@ -3,7 +3,7 @@
 // back to the platform fetch otherwise, and records which transport served
 // each request. No I/O of its own, so it can be tested with fakes.
 
-import { Http4Error, httpStatusFor, type Http4Response } from "./transport.ts";
+import { Http4Error, httpStatusFor, type Http4Response, type Http4Stream } from "./transport.ts";
 import { ErrorCode } from "./wire.ts";
 
 /**
@@ -24,9 +24,13 @@ export interface RequestReport {
   reason?: string;
   /** HTTP status of the returned Response; 0 if the platform fetch threw. */
   status: number;
-  /** Time from the call to the Response being available (body included for HTTP4). */
+  /**
+   * Time from the call to the Response being available. For a streaming
+   * HTTP4 body that is when its metadata arrived, not when the body finished;
+   * for a buffered one it includes the whole body.
+   */
   ms: number;
-  /** Body bytes: exact for HTTP4, from Content-Length for the platform fetch, null if unknown. */
+  /** Body bytes: exact for a buffered HTTP4 body, else the declared length, null if unknown. */
   bytes: number | null;
 }
 
@@ -34,6 +38,8 @@ export interface RequestReport {
 export interface AssetRequester {
   readonly isOpen: boolean;
   request(assetId: string): Promise<Http4Response>;
+  /** Resolves once the metadata is in, with the body still arriving. */
+  requestStream?(assetId: string): Promise<Http4Stream>;
 }
 
 export interface FetcherOptions {
@@ -45,6 +51,12 @@ export interface FetcherOptions {
   onRequest?: (r: RequestReport) => void;
   /** How many recent requests report() keeps (default 1000). */
   reportLimit?: number;
+  /**
+   * Hand back a streaming body as soon as the metadata arrives, so the
+   * browser can parse and compile while the transfer runs (default true when
+   * the session supports it). Off: the Response carries the whole body.
+   */
+  stream?: boolean;
 }
 
 /**
@@ -81,8 +93,12 @@ export function responseFor(r: Http4Response, head: boolean): Response {
 
 /** Response headers for an HTTP4 transfer: its META plus Content-Length. */
 export function headersFor(r: Http4Response): [string, string][] {
-  const headers: [string, string][] = Object.entries(r.headers);
-  headers.push(["content-length", String(r.body.length)]);
+  return metaHeaders(r.headers, r.body.length);
+}
+
+function metaHeaders(meta: Record<string, string>, length: number): [string, string][] {
+  const headers: [string, string][] = Object.entries(meta);
+  headers.push(["content-length", String(length)]);
   return headers;
 }
 
@@ -92,7 +108,16 @@ export function headersFor(r: Http4Response): [string, string][] {
  * threads) or the reason the platform fetch should serve it instead.
  */
 export type Http4Outcome =
-  | { transport: "http4"; status: number; headers: [string, string][]; body: Uint8Array<ArrayBuffer> | null }
+  | {
+      transport: "http4";
+      status: number;
+      headers: [string, string][];
+      body: Uint8Array<ArrayBuffer> | null;
+      /** A body still arriving; `body` is null when it is set. */
+      stream?: ReadableStream<Uint8Array<ArrayBuffer>>;
+      /** Declared body length, for reports, when the body is a stream. */
+      length?: number;
+    }
   | { transport: "fallback" | "platform"; reason: string };
 
 export class Http4Fetcher {
@@ -154,8 +179,8 @@ export class Http4Fetcher {
     if (skip) return viaPlatform("platform", skip);
     const o = await this.outcome(url, method, signal);
     if (o.transport !== "http4") return viaPlatform(o.transport, o.reason);
-    record("http4", o.status, o.body?.length ?? 0);
-    return new Response(o.body, { status: o.status, headers: o.headers, ...(o.status === 404 ? { statusText: "Not Found" } : {}) });
+    record("http4", o.status, o.stream ? (o.length ?? null) : (o.body?.length ?? 0));
+    return new Response(o.stream ?? o.body, { status: o.status, headers: o.headers, ...(o.status === 404 ? { statusText: "Not Found" } : {}) });
   }
 
   /**
@@ -169,9 +194,15 @@ export class Http4Fetcher {
     if (!this.session?.isOpen) return { transport: "fallback", reason: this.unavailableReason ?? "HTTP4 unavailable" };
 
     signal?.throwIfAborted();
-    let r: Http4Response;
+    // A HEAD has no body to stream, and a buffered caller wants the bytes.
+    const streaming = (this.opts.stream ?? true) && method !== "HEAD" && this.session.requestStream !== undefined;
     try {
-      r = await abortable(this.session.request(assetId), signal);
+      if (streaming) {
+        const s = await abortable(this.session.requestStream!(assetId), signal);
+        return { transport: "http4", status: 200, headers: metaHeaders(s.headers, s.size), body: null, stream: s.body, length: s.size };
+      }
+      const r = await abortable(this.session.request(assetId), signal);
+      return { transport: "http4", status: 200, headers: headersFor(r), body: method === "HEAD" ? null : r.body };
     } catch (e) {
       if (signal?.aborted && e === signal.reason) throw e;
       if (e instanceof Http4Error && e.code === ErrorCode.NOT_FOUND) {
@@ -180,7 +211,6 @@ export class Http4Fetcher {
       }
       return { transport: "fallback", reason: `HTTP4 ${httpStatusFor(e)}: ${e instanceof Error ? e.message : String(e)}` };
     }
-    return { transport: "http4", status: 200, headers: headersFor(r), body: method === "HEAD" ? null : r.body };
   }
 
   /** Why a request can't go over HTTP4 regardless of its path, or null. */

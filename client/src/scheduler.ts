@@ -33,6 +33,7 @@ interface Entry {
   size: number;
   granted: number;
   received: number;
+  paused?: boolean; // a streaming consumer is behind: no new grants for now
   seq: number; // arrival order, breaks ties
 }
 
@@ -76,6 +77,18 @@ export class SrptScheduler {
     if (e) e.received += bytes;
   }
 
+  /**
+   * Stop (or resume) granting an RPC while its reader is behind: a streaming
+   * body whose consumer isn't keeping up shouldn't pull more bytes into
+   * memory. What it already holds still counts against the budget, so the
+   * others see the true amount in flight, but it takes no new grants and
+   * doesn't make the budget look exhausted.
+   */
+  setPaused(rpcId: bigint, paused: boolean): void {
+    const e = this.rpcs.get(rpcId);
+    if (e) e.paused = paused;
+  }
+
   /** Current grant ceiling for an RPC, or undefined if it isn't scheduled. */
   granted(rpcId: bigint): number | undefined {
     return this.rpcs.get(rpcId)?.granted;
@@ -96,7 +109,7 @@ export class SrptScheduler {
   grants(reserved = 0): GrantDecision[] {
     let available = this.budget - reserved - this.outstanding();
     const candidates = [...this.rpcs.entries()]
-      .filter(([, e]) => e.granted < e.size)
+      .filter(([, e]) => e.granted < e.size && !e.paused)
       .sort(([, a], [, b]) => a.size - a.received - (b.size - b.received) || a.seq - b.seq);
     this.limited = candidates.length > 0 && available < this.opts.minIncrement;
     if (available <= 0) return [];

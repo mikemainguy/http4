@@ -52,6 +52,12 @@ export interface ConnectOptions extends ClientOptions {
   onRequest?: (r: RequestReport) => void;
   /** How many recent requests report() keeps. Default 1000. */
   reportLimit?: number;
+  /**
+   * Hand back a streaming body as soon as the metadata arrives, so the
+   * browser parses and compiles while the transfer runs (default true). Off:
+   * a Response carries the whole body, as before.
+   */
+  stream?: boolean;
   /** Give up connecting after this long and serve everything via fallback. Default 5000. */
   connectTimeoutMs?: number;
   /** The fetch used for fallback and non-HTTP4 requests. Default globalThis.fetch. */
@@ -90,7 +96,7 @@ export interface Opened {
 /** connect(), also returning the fetcher. Internal: the Service Worker bridge uses it. */
 export async function open(opts: ConnectOptions = {}): Promise<Opened> {
   const {
-    webTransportUrl, certHash, configUrl, assetPrefix, pathToAssetId, baseUrl: base, onRequest, reportLimit,
+    webTransportUrl, certHash, configUrl, assetPrefix, pathToAssetId, baseUrl: base, onRequest, reportLimit, stream,
     connectTimeoutMs, fetch: fetchOpt, ...clientOpts
   } = opts;
   const baseUrl = base ?? globalThis.location?.href;
@@ -110,14 +116,14 @@ export async function open(opts: ConnectOptions = {}): Promise<Opened> {
   }
 
   const prefix = pathToAssetId ? undefined : (assetPrefix ?? cfg.assetPrefix ?? DEFAULT_ASSET_PREFIX);
-  return build(client, reason, prefix, { baseUrl, pathToAssetId, platformFetch, onRequest, reportLimit });
+  return build(client, reason, prefix, { baseUrl, pathToAssetId, platformFetch, onRequest, reportLimit, stream });
 }
 
 /**
  * A fallback-only handle that never opens a session, for a page that turned
  * HTTP4 off. Internal: the Service Worker bridge uses it.
  */
-export function openDisabled(reason: string, opts: Pick<ConnectOptions, "baseUrl" | "fetch" | "onRequest" | "reportLimit"> = {}): Opened {
+export function openDisabled(reason: string, opts: Pick<ConnectOptions, "baseUrl" | "fetch" | "onRequest" | "reportLimit" | "stream"> = {}): Opened {
   const baseUrl = opts.baseUrl ?? globalThis.location?.href;
   if (!baseUrl) throw new TypeError("http4: no baseUrl and no location to default it from");
   return build(undefined, reason, undefined, {
@@ -126,6 +132,7 @@ export function openDisabled(reason: string, opts: Pick<ConnectOptions, "baseUrl
     platformFetch: opts.fetch ?? globalThis.fetch.bind(globalThis),
     onRequest: opts.onRequest,
     reportLimit: opts.reportLimit,
+    stream: opts.stream,
   });
 }
 
@@ -139,6 +146,7 @@ function build(
     platformFetch: typeof fetch;
     onRequest: ((r: RequestReport) => void) | undefined;
     reportLimit: number | undefined;
+    stream: boolean | undefined;
   },
 ): Opened {
   const fetcher = new Http4Fetcher(client ?? null, reason, {
@@ -147,6 +155,7 @@ function build(
     platformFetch: o.platformFetch,
     ...(o.onRequest ? { onRequest: o.onRequest } : {}),
     ...(o.reportLimit !== undefined ? { reportLimit: o.reportLimit } : {}),
+    ...(o.stream !== undefined ? { stream: o.stream } : {}),
   });
   const handle: Http4 = {
     fetch: (input, init) => fetcher.fetch(input, init),

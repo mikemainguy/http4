@@ -76,6 +76,12 @@ export interface ClientOptions {
    * server that doesn't support them ignores the offer. Off: plain v1.
    */
   sessionSeq?: boolean;
+  /**
+   * How many body bytes a streaming transfer may queue for a reader that
+   * hasn't taken them yet (default 1 MiB). Past it the transfer stops being
+   * granted until the reader catches up.
+   */
+  streamHighWaterMark?: number;
   /** Record every grant decision (for tests). */
   trace?: GrantTrace[];
   /** TESTING ONLY: return true to drop an outgoing packet, simulating loss. */
@@ -101,6 +107,7 @@ export interface ClientStats {
   seqLost: number; // sequence numbers declared lost
   seqResendsSent: number; // RESEND_SEQ packets
   metaIn: number;
+  streamPauses: number; // times a slow reader stopped its transfer being granted
   recoveries: number;
   droppedOutgoing: number;
   srttMs: number | null;
@@ -123,6 +130,17 @@ export class Http4Error extends Error {
 export interface Http4Response {
   body: Uint8Array<ArrayBuffer>;
   headers: Record<string, string>; // lowercase names, e.g. "content-type"
+}
+
+/**
+ * A request whose body is still arriving: the META fields and total size are
+ * known, and `body` yields the bytes in order as they arrive. The stream
+ * errors if the transfer fails, so a truncated body never looks complete.
+ */
+export interface Http4Stream {
+  body: ReadableStream<Uint8Array<ArrayBuffer>>;
+  size: number;
+  headers: Record<string, string>;
 }
 
 /**
@@ -149,6 +167,15 @@ export function httpStatusFor(err: unknown): number {
   return 502;
 }
 
+/** A streaming transfer's body, and what the reader has taken so far. */
+interface StreamState {
+  body: ReadableStream<Uint8Array<ArrayBuffer>>;
+  controller: ReadableStreamDefaultController<Uint8Array<ArrayBuffer>>;
+  emitted: number; // bytes already enqueued: always the gap-free prefix
+  paused: boolean; // the reader is behind, so the transfer takes no new grants
+  closed: boolean; // the stream has been closed or errored
+}
+
 interface Transfer {
   rpcId: bigint;
   assetId: string;
@@ -159,7 +186,9 @@ interface Transfer {
   tailProbed: boolean; // a tail loss probe went out since the last progress
   headers?: Record<string, string>; // set by the first META
   replied: boolean; // anything has arrived for it (RTT sample taken)
-  resolve(r: Http4Response): void;
+  stream?: StreamState; // streaming mode: the caller gets the body as it arrives
+  settled: boolean; // the caller's promise has been resolved or rejected
+  resolve(r: Http4Response | Http4Stream): void;
   reject(e: Error): void;
   reqSentAt: number;
   reqRetransmitted: boolean; // Karn: no RTT sample from an ambiguous REQ
@@ -212,6 +241,14 @@ const HELLO_REPEATS = 3;
 // A lost number's RESEND_SEQ goes out at most this many times (the first plus
 // repeats a repair delay apart), since nothing shows that a RESEND_SEQ was lost.
 const SEQ_RESEND_TRIES = 3;
+// Body bytes a streaming transfer may hold for a reader that hasn't taken
+// them. Roughly a BDP on a fast path, so a prompt reader never stalls.
+const DEFAULT_STREAM_HIGH_WATER_MARK = 1024 * 1024;
+// Bytes to gather before enqueueing, while the reader still has something to
+// read. One chunk per datagram means thousands of tiny enqueues for a few MiB,
+// which costs real throughput; a reader that has caught up is never made to
+// wait for this, so it doesn't add latency.
+const STREAM_CHUNK = 64 * 1024;
 
 export class Http4Client {
   readonly maxDatagramSize: number;
@@ -229,6 +266,7 @@ export class Http4Client {
   private readonly earlyResend: boolean;
   private readonly reorderPackets: number;
   private readonly sessionSeq: boolean;
+  private readonly streamHighWaterMark: number;
   private readonly seq = new SeqTracker();
   private lastSeqDetect = -Infinity;
   private payloadSeen = 0; // largest DATA payload so far: the server's packet size
@@ -266,11 +304,12 @@ export class Http4Client {
     this.earlyResend = opts.earlyResend ?? true;
     this.reorderPackets = opts.reorderPackets ?? DEFAULT_REORDER_PACKETS;
     this.sessionSeq = opts.sessionSeq ?? true;
+    this.streamHighWaterMark = opts.streamHighWaterMark ?? DEFAULT_STREAM_HIGH_WATER_MARK;
     this.stats = {
       packetsIn: 0, malformedIn: 0, dataBytesIn: 0, duplicateBytesIn: 0, grantsSent: 0, reqsSent: 0,
       reqRetransmits: 0, resendsSent: 0, earlyResends: 0, tailProbes: 0, spuriousRepairs: 0, reorderWindowMs: 0,
       hellosSent: 0, seqNegotiated: false, dataSeqIn: 0, seqLost: 0, seqResendsSent: 0,
-      metaIn: 0, recoveries: 0, droppedOutgoing: 0, srttMs: null, rtoMs: this.rto(),
+      metaIn: 0, streamPauses: 0, recoveries: 0, droppedOutgoing: 0, srttMs: null, rtoMs: this.rto(),
       budget: this.budget.budget, bdpBytes: 0, minRttMs: null,
     };
     this.stats.reorderWindowMs = this.reorderWindow();
@@ -299,8 +338,27 @@ export class Http4Client {
     return this.request(assetId).then((r) => r.body);
   }
 
-  /** Fetch one asset by ID. Resolves with its bytes and metadata. */
+  /** Fetch one asset by ID. Resolves with its bytes and metadata, once it is all there. */
   request(assetId: string): Promise<Http4Response> {
+    return this.start(assetId, false) as Promise<Http4Response>;
+  }
+
+  /**
+   * Fetch one asset by ID, resolving as soon as its metadata and size are
+   * known, with the body as a stream that fills as bytes arrive. The browser
+   * can then parse or compile while the transfer is still running.
+   *
+   * The stream yields the gap-free prefix, so a missing packet pauses it
+   * until the repair lands, and a failed transfer errors it: what a reader
+   * has consumed is always a correct prefix of the asset, and a truncated
+   * body never ends cleanly. A reader that falls `streamHighWaterMark` bytes
+   * behind stops the transfer being granted until it catches up.
+   */
+  requestStream(assetId: string): Promise<Http4Stream> {
+    return this.start(assetId, true) as Promise<Http4Stream>;
+  }
+
+  private start(assetId: string, streaming: boolean): Promise<Http4Response | Http4Stream> {
     if (!this.isOpen) return Promise.reject(new Http4Error(this.closed ? "client closed" : "session closed"));
     const rpcId = newRpcId();
     const initialGrant = this.nextInitialGrant();
@@ -311,15 +369,49 @@ export class Http4Client {
     }
     return new Promise((resolve, reject) => {
       const now = performance.now();
-      this.transfers.set(rpcId, {
-        rpcId, assetId, initialGrant, replied: false, resolve, reject, lastDetect: -Infinity, tailProbed: false,
+      const t: Transfer = {
+        rpcId, assetId, initialGrant, replied: false, settled: false, resolve, reject, lastDetect: -Infinity, tailProbed: false,
         reqSentAt: now, reqRetransmitted: false, baseRto: this.rto(), ceiling: initialGrant, lastProgress: now, recoveries: 0,
-      });
+      };
+      if (streaming) t.stream = this.makeStream(t);
+      this.transfers.set(rpcId, t);
       this.startTicker();
       this.stats.reqsSent++;
       this.sendHello();
       this.send(req);
     });
+  }
+
+  /**
+   * The body stream of a streaming transfer. Its queue is measured in bytes,
+   * so backpressure is about how much the reader is behind, not how many
+   * chunks: `pull` means the reader has taken some, so grants resume.
+   */
+  private makeStream(t: Transfer): StreamState {
+    let st!: StreamState;
+    const body = new ReadableStream<Uint8Array<ArrayBuffer>>(
+      {
+        start: (controller) => {
+          st = { body: undefined as unknown as ReadableStream<Uint8Array<ArrayBuffer>>, controller, emitted: 0, paused: false, closed: false };
+        },
+        pull: () => {
+          if (st.paused) {
+            st.paused = false;
+            this.scheduler.setPaused(t.rpcId, false);
+            this.pumpGrants();
+          }
+        },
+        cancel: () => {
+          // Nothing can un-cancel a reader, and the protocol has no cancel:
+          // stop granting and let the server's idle eviction clear its state.
+          st.closed = true;
+          this.drop(t);
+        },
+      },
+      new ByteLengthQueuingStrategy({ highWaterMark: this.streamHighWaterMark }),
+    );
+    st.body = body;
+    return st;
   }
 
   /** Offer session sequence numbers, until the server has taken them up or we've asked enough. */
@@ -423,6 +515,7 @@ export class Http4Client {
         t.headers = Object.fromEntries(p.fields);
         t.lastProgress = performance.now();
         t.recoveries = 0;
+        this.maybeStart(t);
         if (t.asm?.complete) this.finish(t);
         return;
       }
@@ -457,6 +550,8 @@ export class Http4Client {
           t.recoveries = 0;
           t.tailProbed = false;
         }
+        this.maybeStart(t);
+        this.flushStream(t);
         if (t.asm.complete && t.headers) return this.finish(t);
         const now = performance.now();
         if (now - t.lastDetect >= DETECT_INTERVAL_MS) this.detectLoss(t, now);
@@ -533,9 +628,11 @@ export class Http4Client {
       // arriving for its transfer, so the tick runs detection too.
       if (t.asm) this.detectLoss(t, now);
       const granted = t.asm ? (this.scheduler.granted(t.rpcId) ?? 0) : 0;
-      const waiting = t.asm !== undefined && t.headers !== undefined && t.asm.received >= granted;
+      // Nothing outstanding: it's queued behind shorter transfers, not stalled.
+      // A paused transfer is waiting on its own reader, which is not a stall
+      // either, however long the reader takes.
+      const waiting = (t.asm !== undefined && t.headers !== undefined && t.asm.received >= granted) || t.stream?.paused === true;
       if (waiting) {
-        // Nothing outstanding: it's queued behind shorter transfers, not stalled.
         t.lastProgress = now;
         continue;
       }
@@ -751,11 +848,74 @@ export class Http4Client {
     this.stats.reorderWindowMs = this.reorderWindow();
   }
 
+  /**
+   * Hand a streaming caller its body as soon as the size (first DATA) and the
+   * META fields are both known. The bytes keep arriving into the same stream.
+   */
+  private maybeStart(t: Transfer): void {
+    const st = t.stream;
+    if (!st || t.settled || !t.asm || !t.headers) return;
+    t.settled = true;
+    t.resolve({ body: st.body, size: t.asm.size, headers: t.headers });
+  }
+
+  /**
+   * Enqueue the bytes that have become contiguous since the last flush, and
+   * pause the transfer if that puts the reader too far behind. The chunk is a
+   * view on the reassembly buffer: those bytes are already final, and a
+   * duplicate packet only ever rewrites them with the same content.
+   */
+  private flushStream(t: Transfer): void {
+    const st = t.stream;
+    if (!st || st.closed || !t.asm) return;
+    const to = t.asm.contiguous;
+    const pending = to - st.emitted;
+    // Hand the first bytes over the moment they exist, so the consumer can
+    // start; after that coalesce, because a chunk per packet costs far more in
+    // queue and Service Worker overhead than it saves in latency. Anything
+    // left under a chunk is flushed when the transfer completes or fails.
+    if (pending > 0 && (st.emitted === 0 || pending >= STREAM_CHUNK || t.asm.complete)) {
+      const chunk = t.asm.bytes.subarray(st.emitted, to) as Uint8Array<ArrayBuffer>;
+      st.emitted = to;
+      st.controller.enqueue(chunk);
+    }
+    const behind = (st.controller.desiredSize ?? 0) <= 0;
+    if (behind && !st.paused) {
+      st.paused = true;
+      this.stats.streamPauses++;
+      this.scheduler.setPaused(t.rpcId, true);
+    }
+  }
+
+  /** Forget a transfer without settling it: its reader cancelled the stream. */
+  private drop(t: Transfer): void {
+    this.transfers.delete(t.rpcId);
+    this.scheduler.remove(t.rpcId);
+    this.pumpGrants();
+  }
+
   private finish(t: Transfer, err?: Error): void {
     this.transfers.delete(t.rpcId);
     this.scheduler.remove(t.rpcId);
-    if (err) t.reject(err);
-    else t.resolve({ body: t.asm!.bytes, headers: t.headers! });
+    const st = t.stream;
+    if (st) {
+      if (!err) this.flushStream(t);
+      if (!st.closed) {
+        st.closed = true;
+        // A failed transfer errors the stream, so a truncated body can never
+        // be mistaken for a complete one. A caller that hasn't been answered
+        // yet (no META, or no size) gets the failure as a rejection instead,
+        // and never sees the stream.
+        if (err) st.controller.error(err);
+        else st.controller.close();
+      }
+    }
+    if (!t.settled) {
+      t.settled = true;
+      if (err) t.reject(err);
+      else if (st) t.resolve({ body: st.body, size: t.asm!.size, headers: t.headers! });
+      else t.resolve({ body: t.asm!.bytes, headers: t.headers! });
+    }
     this.pumpGrants(); // its budget is free for the others
   }
 

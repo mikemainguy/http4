@@ -1,0 +1,87 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>SW stream spike</title></head>
+<body>
+<script>
+// The page answers the worker's "serve" messages three ways, so the spike can
+// compare transferring a ReadableStream, posting chunks, and today's single
+// transferred ArrayBuffer.
+const CHUNK = 1183;      // the server's DATA payload
+const TOTAL = 4 << 20;   // 4 MiB body
+const PACE_MS = 0;       // chunks are produced as fast as the consumer takes them
+
+window.__spike = { transferThrew: null };
+
+function chunkBytes(i) {
+  const b = new Uint8Array(CHUNK);
+  b[0] = i & 0xff;
+  return b;
+}
+
+navigator.serviceWorker.addEventListener("message", (e) => {
+  if (e.data?.spike !== "serve") return;
+  const port = e.ports[0];
+  const mode = e.data.mode;
+  const chunks = Math.ceil(TOTAL / CHUNK);
+
+  if (mode === "transfer") {
+    let i = 0;
+    const stream = new ReadableStream({
+      pull(controller) {
+        if (i >= chunks) return controller.close();
+        controller.enqueue(chunkBytes(i++));
+      },
+    });
+    try {
+      port.postMessage({ kind: "stream", stream }, [stream]);
+      window.__spike.transferThrew = false;
+    } catch (err) {
+      window.__spike.transferThrew = String(err);
+      // Fall back so the fetch still completes.
+      port.postMessage({ kind: "buffer", buffer: new ArrayBuffer(0) }, []);
+    }
+    return;
+  }
+
+  if (mode === "chunks") {
+    port.onmessage = () => {
+      let i = 0;
+      const send = () => {
+        for (let n = 0; n < 64 && i < chunks; n++, i++) {
+          const b = chunkBytes(i);
+          port.postMessage({ chunk: b.buffer }, [b.buffer]);
+        }
+        if (i < chunks) setTimeout(send, PACE_MS);
+        else port.postMessage({ done: true });
+      };
+      send();
+    };
+    port.postMessage({ kind: "chunks" });
+    return;
+  }
+
+  const buf = new ArrayBuffer(TOTAL);
+  new Uint8Array(buf)[0] = 7;
+  port.postMessage({ kind: "buffer", buffer: buf }, [buf]);
+});
+navigator.serviceWorker.startMessages();
+
+window.__measure = async (mode) => {
+  const t0 = performance.now();
+  const res = await fetch(`/stream/${mode}?t=${Date.now()}`);
+  const headers = performance.now() - t0;
+  const reader = res.body.getReader();
+  let first = null, bytes = 0;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (first === null) first = performance.now() - t0;
+    bytes += value.byteLength;
+  }
+  return { mode, headersMs: +headers.toFixed(1), firstChunkMs: +(first ?? -1).toFixed(1), totalMs: +(performance.now() - t0).toFixed(1), bytes };
+};
+
+window.__ready = navigator.serviceWorker.register("/sw.js").then(() => navigator.serviceWorker.ready).then(() => true);
+</script>
+</body>
+</html>

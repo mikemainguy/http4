@@ -27,3 +27,4 @@ testdata/assets/*
 # demo site: generated gallery images (examples/demo-site/gen-images.ts) and the built server
 examples/demo-site/img/
 bin/
+spikes/*/www/sw.js
