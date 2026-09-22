@@ -8,6 +8,15 @@ export const PacketType = {
   RESEND: 0x04,
   ERROR: 0x05,
   META: 0x06,
+  // v2, negotiated per session (docs/wire-format.md, "Capabilities"):
+  HELLO: 0x07,
+  DATA_SEQ: 0x08,
+  RESEND_SEQ: 0x09,
+} as const;
+
+/** Capability bits a client offers in HELLO. Unknown bits are ignored by servers. */
+export const Capability = {
+  SESSION_SEQ: 1 << 0, // server sends DATA_SEQ and accepts RESEND_SEQ
 } as const;
 
 export const ErrorCode = {
@@ -23,6 +32,9 @@ const GRANT_LEN = HEADER_LEN + 5;
 const RESEND_LEN = HEADER_LEN + 8;
 const ERROR_LEN = HEADER_LEN + 1;
 const META_FIXED_LEN = HEADER_LEN + 1; // + count
+const HELLO_LEN = HEADER_LEN + 4; // + capabilities
+export const DATA_SEQ_HEADER_LEN = DATA_HEADER_LEN + 4; // + seq
+const RESEND_SEQ_LEN = HEADER_LEN + 8;
 const MAX_META_VALUE = 0xffff;
 
 /** The only field names META may carry. Bodies are raw bytes: no content-encoding. */
@@ -71,7 +83,36 @@ export interface Meta {
   fields: [name: string, value: string][]; // wire order
 }
 
-export type Packet = Req | Data | Grant | Resend | ErrorPacket | Meta;
+/** v2: capabilities the client offers for this session. rpcId is unused (0). */
+export interface Hello {
+  type: "HELLO";
+  rpcId: bigint;
+  caps: number; // u32 bitfield of Capability
+}
+
+/**
+ * v2: DATA plus a session-wide sequence number. Every DATA_SEQ the server
+ * sends in a session, across all RPCs and including resends, takes the next
+ * number, so a missing number means exactly one lost datagram.
+ */
+export interface DataSeq {
+  type: "DATA_SEQ";
+  rpcId: bigint;
+  totalSize: number;
+  offset: number;
+  seq: number; // u32
+  payload: Uint8Array; // aliases the decoded buffer
+}
+
+/** v2: resend whatever was sent with sequence numbers [start, end). rpcId is unused (0). */
+export interface ResendSeq {
+  type: "RESEND_SEQ";
+  rpcId: bigint;
+  start: number;
+  end: number;
+}
+
+export type Packet = Req | Data | Grant | Resend | ErrorPacket | Meta | Hello | DataSeq | ResendSeq;
 
 export class MalformedPacketError extends Error {
   override name = "MalformedPacketError";
@@ -149,6 +190,24 @@ export function decode(b: Uint8Array): Packet {
       checkMeta(p);
       return p;
     }
+    case PacketType.HELLO:
+      if (b.length !== HELLO_LEN) throw new MalformedPacketError(`HELLO is ${b.length} bytes, want ${HELLO_LEN}`);
+      return { type: "HELLO", rpcId, caps: v.getUint32(9) };
+    case PacketType.DATA_SEQ: {
+      if (b.length < DATA_SEQ_HEADER_LEN) throw new MalformedPacketError(`DATA_SEQ is ${b.length} bytes, need at least ${DATA_SEQ_HEADER_LEN}`);
+      const p: DataSeq = {
+        type: "DATA_SEQ", rpcId, totalSize: v.getUint32(9), offset: v.getUint32(13), seq: v.getUint32(17),
+        payload: b.subarray(DATA_SEQ_HEADER_LEN),
+      };
+      checkDataBounds(p);
+      return p;
+    }
+    case PacketType.RESEND_SEQ: {
+      if (b.length !== RESEND_SEQ_LEN) throw new MalformedPacketError(`RESEND_SEQ is ${b.length} bytes, want ${RESEND_SEQ_LEN}`);
+      const p: ResendSeq = { type: "RESEND_SEQ", rpcId, start: v.getUint32(9), end: v.getUint32(13) };
+      checkResendRange(p);
+      return p;
+    }
   }
   throw new MalformedPacketError(`unknown type 0x${type!.toString(16).padStart(2, "0")}`);
 }
@@ -216,6 +275,33 @@ export function encode(p: Packet): Uint8Array<ArrayBuffer> {
       }
       return b;
     }
+    case "HELLO": {
+      checkU32("caps", p.caps);
+      const { b, v } = header(PacketType.HELLO, p.rpcId, HELLO_LEN);
+      v.setUint32(9, p.caps);
+      return b;
+    }
+    case "DATA_SEQ": {
+      checkU32("totalSize", p.totalSize);
+      checkU32("offset", p.offset);
+      checkU32("seq", p.seq);
+      checkDataBounds(p);
+      const { b, v } = header(PacketType.DATA_SEQ, p.rpcId, DATA_SEQ_HEADER_LEN + p.payload.length);
+      v.setUint32(9, p.totalSize);
+      v.setUint32(13, p.offset);
+      v.setUint32(17, p.seq);
+      b.set(p.payload, DATA_SEQ_HEADER_LEN);
+      return b;
+    }
+    case "RESEND_SEQ": {
+      checkU32("start", p.start);
+      checkU32("end", p.end);
+      checkResendRange(p);
+      const { b, v } = header(PacketType.RESEND_SEQ, p.rpcId, RESEND_SEQ_LEN);
+      v.setUint32(9, p.start);
+      v.setUint32(13, p.end);
+      return b;
+    }
   }
 }
 
@@ -227,7 +313,7 @@ function header(type: number, rpcId: bigint, len: number) {
   return { b, v };
 }
 
-function checkDataBounds(p: Data): void {
+function checkDataBounds(p: Data | DataSeq): void {
   // Plain numbers are exact up to 2^53, so offset + length can't wrap here.
   if (p.offset + p.payload.length > p.totalSize) {
     throw new MalformedPacketError(`DATA [${p.offset}, ${p.offset + p.payload.length}) runs past total_size ${p.totalSize}`);
@@ -264,8 +350,8 @@ function writeAscii(b: Uint8Array, at: number, s: string): void {
   for (let i = 0; i < s.length; i++) b[at + i] = s.charCodeAt(i);
 }
 
-function checkResendRange(p: Resend): void {
-  if (p.start >= p.end) throw new MalformedPacketError(`RESEND range [${p.start}, ${p.end}) is empty`);
+function checkResendRange(p: Resend | ResendSeq): void {
+  if (p.start >= p.end) throw new MalformedPacketError(`${p.type} range [${p.start}, ${p.end}) is empty`);
 }
 
 function checkU64(n: bigint): void {

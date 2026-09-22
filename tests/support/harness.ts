@@ -26,6 +26,12 @@ export interface ServerMetrics {
   rpcs_evicted: number;
   ungranted_bytes_sent: number;
   dropped_data_packets: number;
+  // Session sequence numbers (wire v2):
+  hellos_in: number;
+  data_seq_packets: number;
+  seq_resends: number;
+  seq_resend_misses: number;
+  seq_resend_repeats: number;
 }
 
 /** Final counters the impairment proxy prints on exit (server/cmd/impair). */

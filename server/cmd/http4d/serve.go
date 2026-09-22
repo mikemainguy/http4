@@ -38,6 +38,7 @@ func parseServe(args []string, out io.Writer) (server.Config, error) {
 	clientDir := fs.String("client-dir", "", "serve /http4/ from this `directory` (e.g. client/dist) instead of the built-in bundle")
 	drop := fs.String("drop", "", "drop outgoing DATA to simulate loss: a `spec` like every=7,packet0,final,rate=0.05,seed=1")
 	advertiseWT := fs.String("advertise-wt", "", "advertise this `host:port` for WebTransport, e.g. an impairment proxy")
+	noSeq := fs.Bool("no-seq", false, "don't negotiate session sequence numbers (wire v2); send plain v1 DATA to every client")
 	fs.Usage = func() {
 		fmt.Fprint(out, serveUsage, "\nFlags:\n")
 		printFlags(fs, out, false)
@@ -81,6 +82,7 @@ func parseServe(args []string, out io.Writer) (server.Config, error) {
 		NoH3:        !*h3,
 		DropSpec:    *drop,
 		AdvertiseWT: *advertiseWT,
+		NoSeq:       *noSeq,
 	}, nil
 }
 

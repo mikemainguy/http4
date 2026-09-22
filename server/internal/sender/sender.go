@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"math"
 	"sync"
 	"time"
 
@@ -38,6 +39,9 @@ type Config struct {
 	// NewDropper, if set, makes a loss-injection hook for each session (see
 	// ParseDropSpec). Testing only.
 	NewDropper func() Dropper
+	// NoSeq ignores the client's HELLO, so sessions keep plain v1 DATA even
+	// when the client offers session sequence numbers.
+	NoSeq bool
 }
 
 const (
@@ -46,6 +50,12 @@ const (
 	// The HTTP/3 layer prefixes each datagram with a quarter-stream-ID varint
 	// (1–8 bytes) that QUIC's too-large error doesn't account for.
 	h3DatagramPrefixMax = 8
+	// seqRingSize is how many recently sent DATA_SEQ datagrams the server
+	// remembers, so RESEND_SEQ can name what to send again. 65536 entries is
+	// ~77 MB of payload at 1183 bytes: far more than can be in flight.
+	seqRingSize = 1 << 16
+	// maxResendSeqRange caps how many sequence numbers one RESEND_SEQ may name.
+	maxResendSeqRange = 1024
 )
 
 // Serve runs the HTTP4 protocol on conn until ctx ends or the connection fails.
@@ -64,13 +74,13 @@ func Serve(ctx context.Context, conn Conn, cfg Config) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	s := &session{
-		conn:  conn,
-		cfg:   cfg,
-		m:     cfg.Metrics,
-		rpcs:  make(map[wire.RPCID]*rpc),
-		wake:  make(chan struct{}, 1),
-		chunk: wire.MaxPayload(cfg.InitialMaxDatagram),
-		now:   time.Now,
+		conn:        conn,
+		cfg:         cfg,
+		m:           cfg.Metrics,
+		rpcs:        make(map[wire.RPCID]*rpc),
+		wake:        make(chan struct{}, 1),
+		maxDatagram: cfg.InitialMaxDatagram,
+		now:         time.Now,
 	}
 	if cfg.NewDropper != nil {
 		s.drop = cfg.NewDropper()
@@ -115,12 +125,29 @@ type session struct {
 	now  func() time.Time
 	drop Dropper // nil unless injecting loss; used by the send loop only
 
-	mu      sync.Mutex
-	rpcs    map[wire.RPCID]*rpc
-	pending []wire.Packet // control replies (ERROR), sent before any DATA
-	chunk   int           // DATA payload bytes per datagram
+	mu          sync.Mutex
+	rpcs        map[wire.RPCID]*rpc
+	pending     []wire.Packet // control replies (ERROR), sent before any DATA
+	maxDatagram int           // largest datagram QUIC accepts, as far as we know
+
+	// Session sequence numbers (wire v2), guarded by mu. seqOn is set by the
+	// receive loop when a HELLO offers CapSessionSeq; nextSeq and ring are
+	// written by the send loop and read by the receive loop for RESEND_SEQ.
+	seqOn   bool
+	nextSeq uint64 // the next DATA_SEQ's number; past MaxUint32 we fall back to DATA
+	ring    []seqEntry
 
 	wake chan struct{}
+}
+
+// seqEntry records what one DATA_SEQ carried, so RESEND_SEQ can name it.
+type seqEntry struct {
+	seq    uint32
+	valid  bool
+	resent bool // already queued again once: repeats of the same RESEND_SEQ are ignored
+	rpc    wire.RPCID
+	off    uint32
+	n      uint32
 }
 
 func (s *session) signal() {
@@ -199,9 +226,65 @@ func (s *session) handle(p wire.Packet) {
 			r.resends = append(r.resends, span{p.Start, end})
 		}
 
-	default: // DATA or ERROR from a client is a protocol violation
+	case *wire.Hello:
+		s.m.HellosIn.Add(1)
+		if !s.cfg.NoSeq && p.Caps&wire.CapSessionSeq != 0 && !s.seqOn {
+			s.seqOn = true
+			s.ring = make([]seqEntry, seqRingSize)
+		}
+
+	case *wire.ResendSeq:
+		if !s.seqOn {
+			s.m.MalformedIn.Add(1) // never negotiated: the client shouldn't send it
+			return
+		}
+		s.m.SeqResends.Add(1)
+		end := min(uint64(p.End), uint64(p.Start)+maxResendSeqRange)
+		for seq := uint64(p.Start); seq < end; seq++ {
+			s.resendSeq(uint32(seq), now)
+		}
+
+	default: // DATA, DATA_SEQ or ERROR from a client is a protocol violation
 		s.m.MalformedIn.Add(1)
 	}
+}
+
+// resendSeq queues again the bytes the DATA_SEQ numbered seq carried, clipped
+// exactly as RESEND is: to what was granted and already sent. A number the
+// ring no longer holds, or whose RPC has finished or been evicted, is skipped:
+// the client's per-transfer recovery still covers it.
+//
+// Each number is resent at most once. The client repeats a RESEND_SEQ in case
+// it was lost; the repeats must not duplicate data. If the repair itself is
+// lost, it went out under a new number, which the client asks for instead.
+// Caller holds s.mu.
+func (s *session) resendSeq(seq uint32, now time.Time) {
+	e := &s.ring[seq%seqRingSize]
+	if !e.valid || e.seq != seq {
+		s.m.SeqResendMisses.Add(1)
+		return
+	}
+	if e.resent {
+		s.m.SeqResendRepeats.Add(1)
+		return
+	}
+	e.resent = true
+	r := s.rpcs[e.rpc]
+	if r == nil {
+		s.m.SeqResendMisses.Add(1)
+		return
+	}
+	r.lastActive = now
+	end := min(e.off+e.n, r.granted, r.next)
+	if e.off >= end {
+		return
+	}
+	// Consecutive lost datagrams of one RPC merge into one range.
+	if k := len(r.resends) - 1; k >= 0 && r.resends[k].end == e.off {
+		r.resends[k].end = end
+		return
+	}
+	r.resends = append(r.resends, span{e.off, end})
 }
 
 func (r *rpc) raiseGrant(g uint32) {
@@ -219,6 +302,7 @@ type work struct {
 	r       *rpc
 	kind    workKind
 	packet0 uint64 // for workMeta/workPacket0: the request generation this answers
+	seq     bool   // DATA goes out as DATA_SEQ (decided at pick, so the payload fits)
 }
 
 type workKind int
@@ -284,20 +368,32 @@ func (s *session) pick() (work, bool) {
 		return work{}, false
 	}
 	r := best
+	// Only the send loop advances nextSeq, and pick runs on the send loop.
+	seq := s.seqOn && s.nextSeq <= math.MaxUint32
+	chunk := uint32(s.chunk(seq))
 	switch bestKind {
 	case workMeta:
 		return work{pkt: r.meta, r: r, kind: workMeta, packet0: r.packet0Req}, true
 	case workPacket0:
-		n := min(uint32(s.chunk), r.granted)
-		return work{pkt: r.data(0, n), r: r, kind: workPacket0, packet0: r.packet0Req}, true
+		n := min(chunk, r.granted)
+		return work{pkt: r.data(0, n), r: r, kind: workPacket0, packet0: r.packet0Req, seq: seq}, true
 	case workResend:
 		sp := r.resends[0]
-		n := min(uint32(s.chunk), sp.end-sp.start)
-		return work{pkt: r.data(sp.start, n), r: r, kind: workResend}, true
+		n := min(chunk, sp.end-sp.start)
+		return work{pkt: r.data(sp.start, n), r: r, kind: workResend, seq: seq}, true
 	default:
-		n := min(uint32(s.chunk), r.granted-r.next)
-		return work{pkt: r.data(r.next, n), r: r, kind: workNew}, true
+		n := min(chunk, r.granted-r.next)
+		return work{pkt: r.data(r.next, n), r: r, kind: workNew, seq: seq}, true
 	}
+}
+
+// chunk is how many payload bytes one DATA (or DATA_SEQ) datagram carries.
+// Caller holds s.mu.
+func (s *session) chunk(seq bool) int {
+	if seq {
+		return max(1, wire.MaxPayloadSeq(s.maxDatagram))
+	}
+	return max(1, wire.MaxPayload(s.maxDatagram))
 }
 
 // due reports the most urgent kind of packet r has waiting, if any.
@@ -339,7 +435,15 @@ func (s *session) send(ctx context.Context, w work) bool {
 		}
 	}
 
-	b, err := wire.Marshal(w.pkt)
+	// DATA_SEQ is DATA with the next session sequence number: the G2 check
+	// above and every counter below treat it exactly like DATA.
+	out := w.pkt
+	var seq uint32
+	if isData && w.seq {
+		seq = uint32(s.nextSeq) // only the send loop writes nextSeq
+		out = &wire.DataSeq{Data: *d, Seq: seq}
+	}
+	b, err := wire.Marshal(out)
 	if err != nil {
 		log.Printf("BUG: cannot encode %+v: %v", w.pkt, err)
 		return false
@@ -355,7 +459,7 @@ func (s *session) send(ctx context.Context, w work) bool {
 			// Nothing was sent and nothing was recorded, so the same work is
 			// picked again next time, at the smaller chunk size.
 			s.mu.Lock()
-			s.chunk = max(1, wire.MaxPayload(int(tooLarge.MaxDatagramPayloadSize)-h3DatagramPrefixMax))
+			s.maxDatagram = int(tooLarge.MaxDatagramPayloadSize) - h3DatagramPrefixMax
 			s.mu.Unlock()
 			s.m.ChunkShrinks.Add(1)
 			return true
@@ -395,6 +499,13 @@ func (s *session) send(ctx context.Context, w work) bool {
 		s.m.ResentBytes.Add(int64(len(d.Payload)))
 	case workNew:
 		w.r.next += uint32(len(d.Payload))
+	}
+	if isData && w.seq {
+		// The number is used up whether the datagram arrived or was dropped
+		// on the way, exactly as a real loss would use it up.
+		s.ring[seq%seqRingSize] = seqEntry{seq: seq, valid: true, rpc: w.r.id, off: d.Offset, n: uint32(len(d.Payload))}
+		s.nextSeq++
+		s.m.DataSeqPackets.Add(1)
 	}
 	s.m.DataPackets.Add(1)
 	s.m.DataBytes.Add(int64(len(d.Payload)))

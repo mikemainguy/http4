@@ -161,3 +161,157 @@ export class RepairTracker {
     return out;
   }
 }
+
+/** What an arriving session sequence number turned out to be. */
+export type SeqArrival = "new" | "reordered" | "spurious" | "duplicate";
+
+/** Which transfer's bytes a DATA_SEQ carried (or, for a lost one, probably carried). */
+export interface SeqHint {
+  rpcId: bigint;
+  start: number;
+  end: number; // exclusive
+}
+
+/**
+ * Session-wide loss detection over DATA_SEQ sequence numbers (wire v2, vrek
+ * iss-fbzcsr1): RACK across every transfer of the session. Unlike a transfer's
+ * own gaps, a number that's missing while later numbers keep arriving shows a
+ * loss even at the very end of a transfer, because other transfers' packets
+ * reveal it. That's how QUIC's packet numbers work.
+ *
+ * - **Missing:** every number between the highest seen and a new higher one.
+ * - **Lost:** a missing number with at least `allowance` later numbers seen
+ *   past it, still missing after the reordering window. It's then *claimed*
+ *   (RESEND_SEQ goes out). The server resends under new numbers, so if the
+ *   repair is lost too, that loss shows up as a new missing number of its
+ *   own. The RESEND_SEQ itself can be lost too, and nothing would show it, so
+ *   `repeats` asks again a few times. The server resends each number only
+ *   once, so the repeats cost a small packet each and never duplicate data.
+ * - **Spurious:** a claimed number that arrives after all (it was only late).
+ *
+ * The client doesn't need to know which transfer a lost number belonged to:
+ * the server remembers what each number carried and resends exactly that.
+ * It can often guess, though: when the packets on both sides of a gap belong
+ * to one transfer, the gap's numbers carried the bytes between them. That
+ * guess (a `hint`) is only used to stop repeating once those bytes have
+ * arrived, so a wrong guess can only cost a repeat or skip one, never
+ * correctness. Pure logic with the clock passed in.
+ */
+export class SeqTracker {
+  private highest = -1;
+  private last: SeqHint | undefined; // what the highest number carried
+  private readonly missing = new Map<number, { since: number; hint: SeqHint | undefined }>();
+  // Claimed numbers still being asked for (few: the losses of the last few
+  // repair delays), and those asked for maxTries times, kept only so a late
+  // original reads as spurious (bounded, oldest dropped first).
+  private readonly claimed = new Map<number, { at: number; tries: number; hint: SeqHint | undefined }>();
+  private readonly settled = new Map<number, number>(); // seq → when it stopped being asked for
+  static readonly MAX_SETTLED = 8192;
+
+  /** Numbers jumping further than this are treated as a restart, not a loss burst. */
+  static readonly MAX_GAP = 4096;
+  /** A claimed number is forgotten after this long; a very late original then reads as a duplicate. */
+  static readonly CLAIM_TTL_MS = 30_000;
+
+  /** Highest number seen so far, or -1. */
+  get top(): number {
+    return this.highest;
+  }
+
+  /** Numbers known missing and not yet claimed. */
+  get outstanding(): number {
+    return this.missing.size;
+  }
+
+  /** Record an arriving number; `where` is what its DATA_SEQ carried. */
+  arrive(seq: number, now: number, where?: SeqHint): SeqArrival {
+    if (seq > this.highest) {
+      if (seq - this.highest - 1 <= SeqTracker.MAX_GAP) {
+        // The gap sits between the previous highest and this packet. If both
+        // belong to one transfer, the missing numbers carried its bytes in
+        // between them.
+        const prev = this.last;
+        const hint =
+          prev && where && seq - this.highest > 1 && prev.rpcId === where.rpcId && prev.end < where.start
+            ? { rpcId: where.rpcId, start: prev.end, end: where.start }
+            : undefined;
+        for (let s = this.highest + 1; s < seq; s++) this.missing.set(s, { since: now, hint });
+      }
+      this.highest = seq;
+      this.last = where;
+      return "new";
+    }
+    if (this.missing.delete(seq)) return "reordered";
+    if (this.claimed.delete(seq) || this.settled.delete(seq)) return "spurious";
+    return "duplicate";
+  }
+
+  /**
+   * Missing numbers now considered lost, as sorted half-open ranges of at
+   * most `maxRange` numbers each. They're recorded as claimed. Like QUIC's
+   * RACK, a number is lost once `allowance` later numbers have passed it and
+   * it has stayed missing for `windowMs`. At the end of a burst there may never
+   * be that many later numbers, so it is also lost once any later number has
+   * arrived and it has stayed missing for `tailWindowMs` (a round trip
+   * longer), instead of waiting for a tail probe.
+   */
+  detect(now: number, allowance: number, windowMs: number, tailWindowMs = Infinity, maxRange = 1024): { start: number; end: number }[] {
+    const lost: number[] = [];
+    for (const [s, m] of this.missing) {
+      const age = now - m.since;
+      if ((this.highest - s >= allowance && age >= windowMs) || age >= tailWindowMs) lost.push(s);
+    }
+    for (const s of lost) {
+      const hint = this.missing.get(s)!.hint;
+      this.missing.delete(s);
+      this.claimed.set(s, { at: now, tries: 1, hint });
+    }
+    return ranges(lost, maxRange);
+  }
+
+  /**
+   * Claimed numbers whose last RESEND_SEQ went out at least `delayMs` ago,
+   * asked for fewer than `maxTries` times: their RESEND_SEQ may have been
+   * lost. They're recorded as asked again. A number whose hint shows its
+   * bytes have since arrived (`repaired(hint)`) is settled instead.
+   */
+  repeats(
+    now: number,
+    delayMs: number,
+    maxTries: number,
+    repaired: (hint: SeqHint) => boolean = () => false,
+    maxRange = 1024,
+  ): { start: number; end: number }[] {
+    const due: number[] = [];
+    for (const [s, c] of this.claimed) {
+      if (now - c.at < delayMs) continue;
+      if (c.tries >= maxTries || (c.hint && repaired(c.hint))) {
+        // Done asking. Remember it a while longer, only to spot a late original.
+        this.claimed.delete(s);
+        this.settled.set(s, now);
+        continue;
+      }
+      c.at = now;
+      c.tries++;
+      due.push(s);
+    }
+    // Bound the settled set: Maps iterate in insertion order, oldest first.
+    for (const [s, at] of this.settled) {
+      if (this.settled.size <= SeqTracker.MAX_SETTLED && now - at <= SeqTracker.CLAIM_TTL_MS) break;
+      this.settled.delete(s);
+    }
+    return ranges(due, maxRange);
+  }
+}
+
+/** Sorted, merged half-open ranges of at most `maxRange` numbers each. */
+function ranges(nums: number[], maxRange: number): { start: number; end: number }[] {
+  nums.sort((a, b) => a - b);
+  const out: { start: number; end: number }[] = [];
+  for (const s of nums) {
+    const last = out.at(-1);
+    if (last && last.end === s && last.end - last.start < maxRange) last.end = s + 1;
+    else out.push({ start: s, end: s + 1 });
+  }
+  return out;
+}

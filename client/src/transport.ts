@@ -24,11 +24,20 @@
 // The grant budget and each REQ's initial grant follow the measured
 // bandwidth-delay product (budget.ts), so throughput isn't capped at a fixed
 // budget ÷ RTT on long paths.
+//
+// Session sequence numbers (wire v2, vrek iss-fbzcsr1): the client offers
+// them with HELLO. A server that supports them numbers every DATA across the
+// session (DATA_SEQ), so a lost datagram shows as a missing number as soon as
+// later ones arrive, whichever transfer they belong to. That includes a lost
+// last packet, which per-transfer detection can only find by probing. The
+// client names lost numbers in RESEND_SEQ, and the server resends what they
+// carried. A server that doesn't know HELLO drops it as an unknown packet and
+// keeps sending plain DATA, so everything above works as before.
 
 import { BudgetController } from "./budget.ts";
-import { Reassembly, RepairTracker } from "./reassembly.ts";
+import { Reassembly, RepairTracker, SeqTracker, type SeqHint } from "./reassembly.ts";
 import { SrptScheduler, type GrantTrace } from "./scheduler.ts";
-import { decode, encode, maxPayload, newRpcId, ErrorCode, MalformedPacketError, type Packet } from "./wire.ts";
+import { decode, encode, maxPayload, newRpcId, Capability, ErrorCode, MalformedPacketError, type Data, type Packet } from "./wire.ts";
 
 export interface ClientOptions {
   /**
@@ -62,6 +71,11 @@ export interface ClientOptions {
   earlyResend?: boolean;
   /** How many packets past a gap the frontier must be before it's a loss suspect (default 3). */
   reorderPackets?: number;
+  /**
+   * Offer session sequence numbers (wire v2) with HELLO (default true). A
+   * server that doesn't support them ignores the offer. Off: plain v1.
+   */
+  sessionSeq?: boolean;
   /** Record every grant decision (for tests). */
   trace?: GrantTrace[];
   /** TESTING ONLY: return true to drop an outgoing packet, simulating loss. */
@@ -81,6 +95,11 @@ export interface ClientStats {
   tailProbes: number; // RESENDs of a stalled tail's last packet, ahead of the stall timer
   spuriousRepairs: number; // times a repaired range arrived twice (the original was only late)
   reorderWindowMs: number; // how long a skipped-over gap may stay missing before it counts as lost
+  hellosSent: number;
+  seqNegotiated: boolean; // a DATA_SEQ has arrived: the server numbers this session's DATA
+  dataSeqIn: number;
+  seqLost: number; // sequence numbers declared lost
+  seqResendsSent: number; // RESEND_SEQ packets
   metaIn: number;
   recoveries: number;
   droppedOutgoing: number;
@@ -187,6 +206,12 @@ const MIN_REPAIR_DELAY_MS = 2;
 // (maxDatagramSendQueueLen), so a repair waits behind no more than that.
 const SERVER_SEND_QUEUE_PACKETS = 32;
 const MAX_DRAIN_MS = 10_000; // a stall timeout never waits longer than this for queued bytes
+// HELLO goes out when the session opens and again with this many REQs, in
+// case it was lost, until a DATA_SEQ shows the server took it up.
+const HELLO_REPEATS = 3;
+// A lost number's RESEND_SEQ goes out at most this many times (the first plus
+// repeats a repair delay apart), since nothing shows that a RESEND_SEQ was lost.
+const SEQ_RESEND_TRIES = 3;
 
 export class Http4Client {
   readonly maxDatagramSize: number;
@@ -203,6 +228,9 @@ export class Http4Client {
   private readonly dropOutgoing: ((p: Packet) => boolean) | undefined;
   private readonly earlyResend: boolean;
   private readonly reorderPackets: number;
+  private readonly sessionSeq: boolean;
+  private readonly seq = new SeqTracker();
+  private lastSeqDetect = -Infinity;
   private payloadSeen = 0; // largest DATA payload so far: the server's packet size
   private reorderSteps = 1;
   private lastSpuriousAt = -Infinity;
@@ -237,13 +265,16 @@ export class Http4Client {
     this.dropOutgoing = opts.dropOutgoing;
     this.earlyResend = opts.earlyResend ?? true;
     this.reorderPackets = opts.reorderPackets ?? DEFAULT_REORDER_PACKETS;
+    this.sessionSeq = opts.sessionSeq ?? true;
     this.stats = {
       packetsIn: 0, malformedIn: 0, dataBytesIn: 0, duplicateBytesIn: 0, grantsSent: 0, reqsSent: 0,
       reqRetransmits: 0, resendsSent: 0, earlyResends: 0, tailProbes: 0, spuriousRepairs: 0, reorderWindowMs: 0,
+      hellosSent: 0, seqNegotiated: false, dataSeqIn: 0, seqLost: 0, seqResendsSent: 0,
       metaIn: 0, recoveries: 0, droppedOutgoing: 0, srttMs: null, rtoMs: this.rto(),
       budget: this.budget.budget, bdpBytes: 0, minRttMs: null,
     };
     this.stats.reorderWindowMs = this.reorderWindow();
+    this.sendHello();
     void this.readLoop();
     void wt.closed.finally(() => {
       this.sessionClosed = true;
@@ -285,8 +316,16 @@ export class Http4Client {
       });
       this.startTicker();
       this.stats.reqsSent++;
+      this.sendHello();
       this.send(req);
     });
+  }
+
+  /** Offer session sequence numbers, until the server has taken them up or we've asked enough. */
+  private sendHello(): void {
+    if (!this.sessionSeq || this.stats.seqNegotiated || this.stats.hellosSent > HELLO_REPEATS) return;
+    this.stats.hellosSent++;
+    this.send({ type: "HELLO", rpcId: 0n, caps: Capability.SESSION_SEQ });
   }
 
   close(): void {
@@ -355,7 +394,21 @@ export class Http4Client {
     }
   }
 
-  private handle(p: Packet): void {
+  private handle(packet: Packet): void {
+    let p = packet;
+    if (p.type === "DATA_SEQ") {
+      // Record the number before looking up the transfer: a datagram for a
+      // finished transfer still used a number up, and must not look lost.
+      const now = performance.now();
+      this.stats.dataSeqIn++;
+      this.stats.seqNegotiated = true;
+      const where = { rpcId: p.rpcId, start: p.offset, end: p.offset + p.payload.length };
+      if (this.seq.arrive(p.seq, now, where) === "spurious") this.noteSpurious(now);
+      if (now - this.lastSeqDetect >= DETECT_INTERVAL_MS) this.detectSeqLoss(now);
+      // From here on it is DATA.
+      const data: Data = { type: "DATA", rpcId: p.rpcId, totalSize: p.totalSize, offset: p.offset, payload: p.payload };
+      p = data;
+    }
     const t = this.transfers.get(p.rpcId);
     if (!t) return; // finished, failed, or not ours
     if (!t.replied && (p.type === "META" || p.type === "DATA")) {
@@ -471,6 +524,9 @@ export class Http4Client {
 
   private tick(): void {
     const now = performance.now();
+    // A missing number's reordering window can end without another packet
+    // arriving, so the tick runs session-wide detection too.
+    if (this.stats.seqNegotiated) this.detectSeqLoss(now);
     for (const t of [...this.transfers.values()]) {
       // A suspect gap's reordering window can end without another packet
       // arriving for its transfer, so the tick runs detection too.
@@ -568,6 +624,12 @@ export class Http4Client {
   private detectLoss(t: Transfer, now: number): void {
     t.lastDetect = now;
     if (!this.earlyResend || !t.asm || !t.repair) return;
+    // With session sequence numbers every gap this could find is also a
+    // missing number (data past it arrived, so later numbers did), and
+    // detectSeqLoss repairs it by number. Running both re-requested bytes
+    // whose repair was still queued behind in-flight data, so here the tail
+    // probe and the stall timer are the only fallback.
+    if (this.stats.seqNegotiated) return;
     // While more data is still expected past the frontier, a gap must be
     // skipped by a few packets before it's a suspect. Once the frontier has
     // reached the grant nothing later will arrive to show it, so only the
@@ -587,6 +649,47 @@ export class Http4Client {
       this.stats.earlyResends++;
       this.send({ type: "RESEND", rpcId: t.rpcId, start: gap.start, end: gap.end });
     }
+  }
+
+  /**
+   * Session-wide early loss detection (wire v2): RESEND_SEQ every sequence
+   * number that `reorderPackets` later numbers have passed and that stayed
+   * missing for the reordering window. The server resends what it carried
+   * under new numbers, so a lost repair is detected the same way. No budget
+   * backoff, for the same reason as detectLoss.
+   */
+  private detectSeqLoss(now: number): void {
+    this.lastSeqDetect = now;
+    if (!this.earlyResend) return;
+    // Near the end of a burst fewer than `reorderPackets` numbers may follow a
+    // loss; then a round trip more of waiting stands in for them (RACK's time
+    // threshold), well before a tail probe would.
+    const window = this.reorderWindow();
+    const tail = window + (this.srtt ?? this.budget.minRttMs ?? this.rto());
+    for (const r of this.seq.detect(now, this.reorderPackets, window, tail)) {
+      this.stats.seqLost += r.end - r.start;
+      this.sendResendSeq(r);
+      this.stats.earlyResends++;
+    }
+    // A RESEND_SEQ can be lost on the way up; ask again once a repair has had
+    // two repair delays to arrive (one is often too soon: the repair queues
+    // behind data already in flight). The server ignores repeats of a number
+    // it already resent, and a number whose bytes have arrived isn't repeated.
+    const again = 2 * this.repairDelay();
+    for (const r of this.seq.repeats(now, again, SEQ_RESEND_TRIES, (h) => this.repaired(h))) this.sendResendSeq(r);
+  }
+
+  /** Whether the bytes a hint names have all arrived, or their transfer is over. */
+  private repaired(h: SeqHint): boolean {
+    const t = this.transfers.get(h.rpcId);
+    if (!t?.asm) return !t; // finished (or failed): nothing left to repair
+    return t.asm.missing(Math.min(h.end, t.asm.size)).every((g) => g.end <= h.start);
+  }
+
+  private sendResendSeq(r: { start: number; end: number }): void {
+    this.stats.seqResendsSent++;
+    this.stats.resendsSent++;
+    this.send({ type: "RESEND_SEQ", rpcId: 0n, start: r.start, end: r.end });
   }
 
   /**
