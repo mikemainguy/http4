@@ -5,6 +5,10 @@
 // fewest bytes left to receive (Shortest Remaining Processing Time). The next
 // RPC gets grants only once every shorter one is fully granted. This is pure
 // logic with no I/O, so it can be tested in Node.
+//
+// The budget can change between calls (it follows the measured bandwidth-delay
+// product; see budget.ts). Shrinking it below what is already outstanding
+// revokes nothing: grants() just hands out nothing until enough has arrived.
 
 export interface GrantDecision {
   rpcId: bigint;
@@ -20,7 +24,7 @@ export interface GrantTrace extends GrantDecision {
 }
 
 export interface SchedulerOptions {
-  budget: number; // max bytes granted-but-not-received across all RPCs
+  budget: number; // max bytes granted-but-not-received across all RPCs (see setBudget)
   minIncrement: number; // don't send a grant smaller than this unless it finishes the RPC
   trace?: GrantTrace[]; // if set, every decision is appended here
 }
@@ -36,9 +40,25 @@ export class SrptScheduler {
   private readonly rpcs = new Map<bigint, Entry>();
   private seq = 0;
   private readonly opts: SchedulerOptions;
+  private budget: number;
+  private limited = false;
 
   constructor(opts: SchedulerOptions) {
     this.opts = opts;
+    this.budget = opts.budget;
+  }
+
+  /** Change the budget for later grants() calls. */
+  setBudget(budget: number): void {
+    this.budget = budget;
+  }
+
+  /**
+   * Whether the last grants() call left a transfer wanting more because the
+   * budget ran out, i.e. the budget, not demand, was the limit.
+   */
+  get budgetLimited(): boolean {
+    return this.limited;
   }
 
   /** Start scheduling an RPC once its size is known. `granted` is what the REQ already allowed. */
@@ -74,12 +94,12 @@ export class SrptScheduler {
    * of REQs whose size isn't known yet.
    */
   grants(reserved = 0): GrantDecision[] {
-    let available = this.opts.budget - reserved - this.outstanding();
-    if (available <= 0) return [];
-
+    let available = this.budget - reserved - this.outstanding();
     const candidates = [...this.rpcs.entries()]
       .filter(([, e]) => e.granted < e.size)
       .sort(([, a], [, b]) => a.size - a.received - (b.size - b.received) || a.seq - b.seq);
+    this.limited = candidates.length > 0 && available < this.opts.minIncrement;
+    if (available <= 0) return [];
 
     const out: GrantDecision[] = [];
     for (let rank = 0; rank < candidates.length && available > 0; rank++) {
@@ -88,7 +108,10 @@ export class SrptScheduler {
       const inc = target - e.granted;
       // Strict SRPT: if the shortest RPC can't take a worthwhile grant yet,
       // nobody longer gets one either.
-      if (inc < this.opts.minIncrement && target < e.size) break;
+      if (inc < this.opts.minIncrement && target < e.size) {
+        this.limited = true;
+        break;
+      }
       const d: GrantDecision = { rpcId, maxOffset: target, priority: Math.min(rank, 7) };
       if (this.opts.trace) {
         this.opts.trace.push({
@@ -101,6 +124,8 @@ export class SrptScheduler {
       available -= inc;
       out.push(d);
     }
+    // Room ran out with someone still wanting more.
+    if (available <= 0 && candidates.some(([, e]) => e.granted < e.size)) this.limited = true;
     return out;
   }
 }
