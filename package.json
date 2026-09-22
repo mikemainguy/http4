@@ -9,7 +9,7 @@
     "test": "npm run typecheck && npm run test:go && npm run test:wire && npm run test:client && npm run test:browser",
     "test:wire": "node --test tests/wire/wire.test.ts",
     "test:client": "node --test \"tests/client/*.test.ts\"",
-    "test:browser": "npm run build && node --test --test-concurrency=1 tests/echo/echo.test.ts tests/fetch/fetch.test.ts tests/loss/loss.test.ts tests/meta/meta.test.ts tests/impair/impair.test.ts",
+    "test:browser": "npm run build && node --test --test-concurrency=1 tests/echo/echo.test.ts tests/fetch/fetch.test.ts tests/loss/loss.test.ts tests/meta/meta.test.ts tests/impair/impair.test.ts tests/h3/h3.test.ts",
     "fixtures": "scripts/gen-fixtures",
     "integrity": "npm run build && node tests/integrity/run.ts"
   },

@@ -26,11 +26,13 @@ import (
 	"http4/server/internal/sender"
 )
 
-// WebTransport paths: HTTP4 itself, and a plain datagram echo kept as a
-// connectivity check.
+// Paths on the QUIC listener: HTTP4 itself, a plain datagram echo kept as a
+// connectivity check, and the same assets over ordinary HTTP/3 as the
+// benchmark baseline.
 const (
 	WebTransportPath = "/wt"
 	EchoPath         = "/echo"
+	H3Path           = "/h3/"
 )
 
 type Config struct {
@@ -51,6 +53,12 @@ type ClientConfig struct {
 	WebTransportURL string `json:"webTransportUrl"`
 	EchoURL         string `json:"echoUrl"`
 	CertHash        string `json:"certHash"` // base64 SHA-256 of the certificate DER
+	// H3URL is the base URL for the assets over plain HTTP/3 (append the
+	// asset ID). SPKIHash is what Chrome needs in
+	// --ignore-certificate-errors-spki-list to accept the dev certificate
+	// for ordinary fetches, which serverCertificateHashes does not cover.
+	H3URL    string `json:"h3Url"`
+	SPKIHash string `json:"spkiHash"`
 }
 
 type Server struct {
@@ -122,6 +130,7 @@ func Start(cfg Config) (*Server, error) {
 		sender.Serve(sess.Context(), sess, sender.Config{Assets: s.assets, Metrics: s.metrics, NewDropper: newDropper})
 	}))
 	wtMux.HandleFunc(EchoPath, s.upgrade(echoDatagrams))
+	wtMux.HandleFunc(H3Path, s.handleH3Asset)
 	h3.Handler = wtMux
 
 	httpMux := http.NewServeMux()
@@ -156,6 +165,8 @@ func (s *Server) ClientConfig() ClientConfig {
 		WebTransportURL: s.WebTransportURL,
 		EchoURL:         strings.TrimSuffix(s.WebTransportURL, WebTransportPath) + EchoPath,
 		CertHash:        base64.StdEncoding.EncodeToString(s.cert.Hash[:]),
+		H3URL:           strings.TrimSuffix(s.WebTransportURL, WebTransportPath) + H3Path,
+		SPKIHash:        base64.StdEncoding.EncodeToString(s.cert.SPKIHash[:]),
 	}
 }
 

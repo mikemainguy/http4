@@ -21,11 +21,15 @@ import (
 // that serverCertificateHashes enforces.
 const Validity = 13 * 24 * time.Hour
 
-// Cert is a generated certificate plus the SHA-256 of its DER encoding, which
-// is the value a browser passes in serverCertificateHashes.
+// Cert is a generated certificate plus two hashes: the SHA-256 of its DER
+// encoding, which a browser passes in serverCertificateHashes (WebTransport
+// only), and the SHA-256 of its SubjectPublicKeyInfo, which Chrome's
+// --ignore-certificate-errors-spki-list takes to trust it for ordinary
+// HTTPS/HTTP3 fetches.
 type Cert struct {
-	TLS  tls.Certificate
-	Hash [sha256.Size]byte
+	TLS      tls.Certificate
+	Hash     [sha256.Size]byte
+	SPKIHash [sha256.Size]byte
 }
 
 // Generate creates a fresh P-256 key and a self-signed certificate for
@@ -57,8 +61,13 @@ func Generate(now time.Time) (*Cert, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create certificate: %w", err)
 	}
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		return nil, fmt.Errorf("parse certificate: %w", err)
+	}
 	return &Cert{
-		TLS:  tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key},
-		Hash: sha256.Sum256(der),
+		TLS:      tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key},
+		Hash:     sha256.Sum256(der),
+		SPKIHash: sha256.Sum256(leaf.RawSubjectPublicKeyInfo),
 	}, nil
 }

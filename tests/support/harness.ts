@@ -50,6 +50,14 @@ export interface HarnessOptions {
    * connect to the proxy, so every QUIC packet crosses the impaired path.
    */
   impair?: string[];
+  /**
+   * Launch Chrome so ordinary fetch() to the server's QUIC port uses HTTP/3
+   * (the benchmark baseline): force QUIC for that origin and trust the dev
+   * certificate by its SPKI hash. serverCertificateHashes only covers
+   * WebTransport, so without these flags fetches to /h3/ fail. With `impair`,
+   * the forced origin is the proxy, so h3 crosses the same impaired path.
+   */
+  h3?: boolean;
 }
 
 /** `extraArgs` go to http4d, e.g. ["-drop", "every=7"]. */
@@ -84,7 +92,7 @@ export async function startHarness(assetsDir: string, extraArgs: string[] = [], 
     return stats;
   };
 
-  let ready: { http: string; webtransport: string; wt_listen: string };
+  let ready: { http: string; webtransport: string; wt_listen: string; spki: string };
   let browser: Browser;
   try {
     ready = JSON.parse(await firstLine(server, "server"));
@@ -96,7 +104,10 @@ export async function startHarness(assetsDir: string, extraArgs: string[] = [], 
       await firstLine(proxy, "impairment proxy", proxyLines);
     }
     // Use an installed Chrome rather than a Playwright-downloaded build.
-    browser = await chromium.launch({ channel: process.env.HTTP4_CHROME_CHANNEL ?? "chrome", headless: true });
+    const chromeArgs = opts.h3
+      ? [`--origin-to-force-quic-on=${new URL(ready.webtransport).host}`, `--ignore-certificate-errors-spki-list=${ready.spki}`]
+      : [];
+    browser = await chromium.launch({ channel: process.env.HTTP4_CHROME_CHANNEL ?? "chrome", headless: true, args: chromeArgs });
   } catch (e) {
     await stopServer();
     throw e;

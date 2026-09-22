@@ -37,6 +37,8 @@ func main() {
 		"http":         srv.HTTPURL,
 		"webtransport": srv.WebTransportURL,
 		"wt_listen":    srv.WTListenAddr,
+		"h3":           srv.ClientConfig().H3URL,
+		"spki":         srv.ClientConfig().SPKIHash,
 	})
 	if *drop != "" {
 		log.Printf("WARNING: injecting loss on outgoing DATA: %s", *drop)
