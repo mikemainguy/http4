@@ -8,6 +8,10 @@
     "isolatedModules": true,
     "verbatimModuleSyntax": true,
     "skipLibCheck": true,
-    "noEmit": true
+    "noEmit": true,
+    // Client modules import each other as "./x.ts" so Node's type stripping
+    // can run them directly in tests; esbuild bundles them for the browser.
+    "allowImportingTsExtensions": true,
+    "erasableSyntaxOnly": true
   }
 }

@@ -2,9 +2,7 @@
   "extends": "../tsconfig.base.json",
   "compilerOptions": {
     "lib": ["es2024", "dom"],
-    "types": ["node"],
-    "allowImportingTsExtensions": true,
-    "erasableSyntaxOnly": true
+    "types": ["node"]
   },
   "include": ["."]
 }

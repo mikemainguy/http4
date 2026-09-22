@@ -1,6 +1,9 @@
-// Scaffold client: connect to the sandbox server's echo endpoint over
-// WebTransport and bounce one datagram off it. The result is rendered and
-// also published on window.__echo so the headless acceptance test can read it.
+// Sandbox page: checks connectivity with a datagram echo, then opens an HTTP4
+// session. Both are published on window (__echo, __http4) so headless tests
+// can drive and inspect them.
+
+import { Http4Client, type ClientStats } from "./transport.ts";
+import type { GrantTrace } from "./scheduler.ts";
 
 interface ClientConfig {
   webTransportUrl: string; // HTTP4
@@ -12,9 +15,16 @@ export type EchoResult =
   | { ok: true; attempts: number; rttMs: number; maxDatagramSize: number }
   | { ok: false; error: string };
 
+export interface Http4Handle {
+  client: Http4Client;
+  trace: GrantTrace[];
+  stats(): ClientStats;
+}
+
 declare global {
   interface Window {
     __echo?: EchoResult;
+    __http4?: Http4Handle | { error: string };
   }
 }
 
@@ -25,15 +35,10 @@ function base64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
   return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
 }
 
-async function connect(): Promise<WebTransport> {
+async function loadConfig(): Promise<ClientConfig> {
   const res = await fetch("/config.json", { cache: "no-store" });
   if (!res.ok) throw new Error(`GET /config.json: ${res.status}`);
-  const cfg = (await res.json()) as ClientConfig;
-  const wt = new WebTransport(cfg.echoUrl, {
-    serverCertificateHashes: [{ algorithm: "sha-256", value: base64ToBytes(cfg.certHash) }],
-  });
-  await wt.ready;
-  return wt;
+  return (await res.json()) as ClientConfig;
 }
 
 // Datagrams are unreliable, so send until one comes back or we run out of attempts.
@@ -65,21 +70,47 @@ async function echoOnce(wt: WebTransport): Promise<EchoResult> {
   return { ok: false, error: `no echo after ${ATTEMPTS} attempts` };
 }
 
+async function runEcho(cfg: ClientConfig, hash: Uint8Array<ArrayBuffer>): Promise<EchoResult> {
+  try {
+    const wt = new WebTransport(cfg.echoUrl, { serverCertificateHashes: [{ algorithm: "sha-256", value: hash }] });
+    await wt.ready;
+    const result = await echoOnce(wt);
+    wt.close();
+    return result;
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 async function main(): Promise<void> {
   const status = document.getElementById("status")!;
-  let result: EchoResult;
+  let cfg: ClientConfig;
   try {
-    const wt = await connect();
-    result = await echoOnce(wt);
-    wt.close();
+    cfg = await loadConfig();
   } catch (err) {
-    result = { ok: false, error: err instanceof Error ? err.message : String(err) };
+    const error = err instanceof Error ? err.message : String(err);
+    window.__echo = { ok: false, error };
+    window.__http4 = { error };
+    status.textContent = error;
+    return;
   }
-  window.__echo = result;
-  status.textContent = result.ok
-    ? `echo ok in ${result.rttMs} ms (${result.attempts} attempt(s)), maxDatagramSize ${result.maxDatagramSize}`
-    : `echo failed: ${result.error}`;
-  status.dataset.ok = String(result.ok);
+  const hash = base64ToBytes(cfg.certHash);
+
+  const echo = await runEcho(cfg, hash);
+  window.__echo = echo;
+  status.textContent = echo.ok
+    ? `echo ok in ${echo.rttMs} ms (${echo.attempts} attempt(s)), maxDatagramSize ${echo.maxDatagramSize}`
+    : `echo failed: ${echo.error}`;
+  status.dataset.ok = String(echo.ok);
+
+  try {
+    const trace: GrantTrace[] = [];
+    const client = await Http4Client.connect(cfg.webTransportUrl, hash, { trace });
+    window.__http4 = { client, trace, stats: () => ({ ...client.stats }) };
+    status.textContent += " · HTTP4 session open";
+  } catch (err) {
+    window.__http4 = { error: err instanceof Error ? err.message : String(err) };
+  }
 }
 
 void main();

@@ -6,9 +6,10 @@
     "build": "esbuild client/src/main.ts --bundle --format=esm --target=chrome120 --sourcemap --outdir=client/dist",
     "typecheck": "tsc -p client && tsc -p tests",
     "test:go": "cd server && go test ./...",
-    "test:echo": "npm run build && node --test tests/echo/echo.test.ts",
-    "test": "npm run typecheck && npm run test:go && npm run test:wire && npm run test:echo",
-    "test:wire": "node --test tests/wire/wire.test.ts"
+    "test": "npm run typecheck && npm run test:go && npm run test:wire && npm run test:client && npm run test:browser",
+    "test:wire": "node --test tests/wire/wire.test.ts",
+    "test:client": "node --test \"tests/client/*.test.ts\"",
+    "test:browser": "npm run build && node --test --test-concurrency=1 tests/echo/echo.test.ts tests/fetch/fetch.test.ts"
   },
   "devDependencies": {
     "@types/node": "^26.6.2",
