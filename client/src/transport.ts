@@ -283,7 +283,8 @@ export class Http4Client {
   }
 
   static async connect(url: string, certHash?: Uint8Array<ArrayBuffer>, opts: ClientOptions = {}): Promise<Http4Client> {
-    const wt = new WebTransport(url, certHash ? { serverCertificateHashes: [{ algorithm: "sha-256", value: certHash }] } : {});
+    // No hash (a CA-trusted certificate): let the browser verify it normally.
+    const wt = new WebTransport(url, certHash?.length ? { serverCertificateHashes: [{ algorithm: "sha-256", value: certHash }] } : {});
     await wt.ready;
     return new Http4Client(wt, opts);
   }

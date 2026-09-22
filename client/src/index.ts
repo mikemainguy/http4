@@ -194,7 +194,9 @@ async function openSession(
     if (noWebTransport) throw new Error("WebTransport not supported");
     if (!cfgOut.webTransportUrl) throw new Error(`config ${configUrl}: no webTransportUrl`);
     url = cfgOut.webTransportUrl;
-    hash ??= cfgOut.certHash;
+    // An absent or empty certHash means a normally-trusted certificate: open
+    // the session without serverCertificateHashes and let the browser verify.
+    hash ??= cfgOut.certHash || undefined;
   }
   if (noWebTransport) throw new Error("WebTransport not supported");
   const bytes = typeof hash === "string" ? Uint8Array.from(atob(hash), (c) => c.charCodeAt(0)) : hash;

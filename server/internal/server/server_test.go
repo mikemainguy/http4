@@ -146,7 +146,7 @@ func TestIsLoopbackOrigin(t *testing.T) {
 		"http://10.0.0.5:8080":   false,
 		"":                       false,
 	} {
-		if got := isLoopbackOrigin(origin, 8080); got != want {
+		if got := isLoopbackOrigin(origin, "http", 8080); got != want {
 			t.Errorf("isLoopbackOrigin(%q) = %v, want %v", origin, got, want)
 		}
 	}

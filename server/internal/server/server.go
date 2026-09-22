@@ -1,12 +1,14 @@
-// Package server wires up the sandbox's two listeners: a plain HTTP server on
-// TCP that serves the browser client and its connection config, and a
-// WebTransport (HTTP/3) server on UDP that carries the HTTP4 datagrams.
+// Package server wires up the two listeners: a TCP HTTP server that serves the
+// pages, the fallback assets and /config.json, and a WebTransport (HTTP/3)
+// server on UDP that carries the HTTP4 datagrams. Both present the same
+// certificate (internal/certs). With the dev certificate the TCP side stays on
+// plain HTTP, which is a secure context on loopback; with a real certificate it
+// serves HTTPS, and an optional third listener redirects plain HTTP to it (and
+// answers ACME HTTP-01).
 package server
 
 import (
 	"cmp"
-	"crypto/tls"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -23,7 +26,7 @@ import (
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/webtransport-go"
 
-	"http4/server/internal/devcert"
+	"http4/server/internal/certs"
 	"http4/server/internal/sender"
 )
 
@@ -62,20 +65,46 @@ type Config struct {
 	ClientFS fs.FS
 	// NoH3 turns off the plain-HTTP/3 baseline route (H3Path).
 	NoH3 bool
+
+	// Cert says where the TLS certificate comes from. The zero value is the
+	// dev certificate: self-signed, pinned by hash, localhost only.
+	Cert certs.Mode
+	// Origins are extra page origins allowed to open WebTransport sessions and
+	// read the h3 baseline, e.g. "https://demo.example". The server's own
+	// loopback origin is always allowed.
+	Origins []string
+	// RedirectAddr, if set, is a TCP address for a plain-HTTP listener that
+	// only redirects to HTTPS and answers ACME HTTP-01. Real certificates only.
+	RedirectAddr string
+	// Metrics decides who may read /metrics.json. The zero value is Public,
+	// which is what the sandbox server and its tests expect.
+	Metrics MetricsAccess
 }
+
+// MetricsAccess says who may read /metrics.json.
+type MetricsAccess int
+
+const (
+	MetricsPublic MetricsAccess = iota // anyone (the sandbox default)
+	MetricsLocal                       // loopback clients only (the serve default)
+	MetricsOff                         // nobody
+)
 
 // ClientConfig is served at /config.json so the page never hard-codes the
 // WebTransport port or the per-run certificate hash.
 type ClientConfig struct {
 	WebTransportURL string `json:"webTransportUrl"`
 	EchoURL         string `json:"echoUrl"`
-	CertHash        string `json:"certHash"` // base64 SHA-256 of the certificate DER
+	// CertHash is the base64 SHA-256 of the certificate DER, for
+	// serverCertificateHashes. It is omitted for a real certificate, which
+	// the browser validates itself.
+	CertHash string `json:"certHash,omitempty"`
 	// H3URL is the base URL for the assets over plain HTTP/3 (append the
 	// asset ID). SPKIHash is what Chrome needs in
 	// --ignore-certificate-errors-spki-list to accept the dev certificate
 	// for ordinary fetches, which serverCertificateHashes does not cover.
 	H3URL    string `json:"h3Url"`
-	SPKIHash string `json:"spkiHash"`
+	SPKIHash string `json:"spkiHash,omitempty"`
 	// AssetPrefix is the same-origin HTTP path prefix whose URLs are HTTP4
 	// assets (URL = prefix + asset ID): "/" in serve mode.
 	AssetPrefix string `json:"assetPrefix"`
@@ -86,27 +115,40 @@ type Server struct {
 	WebTransportURL string // as advertised to clients
 	WTListenAddr    string // where the UDP listener actually is
 
-	cert        *devcert.Cert
+	cert        *certs.Source
+	origins     []string // normalised extra origins allowed to connect
+	metricsTo   MetricsAccess
 	assets      *sender.DirAssets
 	pool        sender.Assets // what HTTP, HTTP4 and h3 read: assets, filtered in serve mode
 	assetPrefix string
 	clientFS    fs.FS
 	noH3        bool
 	metrics     *sender.Metrics
+	httpScheme  string
 	httpPort    int
 	httpLn      net.Listener
+	redirectLn  net.Listener
 	udpConn     net.PacketConn
 	httpSrv     *http.Server
+	redirectSrv *http.Server
 	wtSrv       *webtransport.Server
+	wtDone      chan struct{} // closed when wtSrv.Serve has returned
 	serveErr    chan error
 }
 
 // Start binds both listeners and begins serving. Port 0 in either address picks
 // a free port; the chosen ports are reflected in HTTPURL and WebTransportURL.
 func Start(cfg Config) (*Server, error) {
-	cert, err := devcert.Generate(time.Now())
+	cert, err := certs.Open(cfg.Cert)
 	if err != nil {
 		return nil, err
+	}
+	origins, err := normaliseOrigins(cfg.Origins)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.RedirectAddr != "" && !cert.Trusted() {
+		return nil, errors.New("-redirect needs a real certificate (-cert file:... or acme)")
 	}
 	siteMode := cfg.SiteDir != ""
 	assetPrefix, assetsDir := "/", cfg.SiteDir
@@ -139,25 +181,44 @@ func Start(cfg Config) (*Server, error) {
 		httpLn.Close()
 		return nil, fmt.Errorf("listen webtransport: %w", err)
 	}
+	var redirectLn net.Listener
+	if cfg.RedirectAddr != "" {
+		redirectLn, err = net.Listen("tcp", cfg.RedirectAddr)
+		if err != nil {
+			assets.Close()
+			httpLn.Close()
+			udpConn.Close()
+			return nil, fmt.Errorf("listen redirect: %w", err)
+		}
+	}
+	scheme := "http"
+	if cert.Trusted() {
+		scheme = "https"
+	}
 
 	s := &Server{
-		HTTPURL:         "http://" + httpLn.Addr().String(),
+		HTTPURL:         scheme + "://" + httpLn.Addr().String(),
 		WebTransportURL: "https://" + cmp.Or(cfg.AdvertiseWT, udpConn.LocalAddr().String()) + WebTransportPath,
 		WTListenAddr:    udpConn.LocalAddr().String(),
 		cert:            cert,
+		origins:         origins,
+		metricsTo:       cfg.Metrics,
 		assets:          assets,
 		pool:            pool,
 		assetPrefix:     assetPrefix,
 		clientFS:        cfg.ClientFS,
 		noH3:            cfg.NoH3,
 		metrics:         new(sender.Metrics),
+		httpScheme:      scheme,
 		httpPort:        httpLn.Addr().(*net.TCPAddr).Port,
 		httpLn:          httpLn,
+		redirectLn:      redirectLn,
 		udpConn:         udpConn,
-		serveErr:        make(chan error, 2),
+		wtDone:          make(chan struct{}),
+		serveErr:        make(chan error, 3), // page, redirect and WebTransport
 	}
 	h3 := &http3.Server{
-		TLSConfig:  http3.ConfigureTLSConfig(&tls.Config{Certificates: []tls.Certificate{cert.TLS}}),
+		TLSConfig:  http3.ConfigureTLSConfig(cert.TLS()),
 		QUICConfig: &quic.Config{EnableDatagrams: true, EnableStreamResetPartialDelivery: true},
 	}
 	webtransport.ConfigureHTTP3Server(h3)
@@ -190,10 +251,44 @@ func Start(cfg Config) (*Server, error) {
 	}
 	s.httpSrv = &http.Server{Handler: httpMux, ReadHeaderTimeout: 5 * time.Second}
 
-	go func() { s.serveErr <- s.httpSrv.Serve(httpLn) }()
-	go func() { s.serveErr <- s.wtSrv.Serve(udpConn) }()
+	if cert.Trusted() {
+		// ServeTLS rather than a wrapped listener, so Go sets up HTTP/2 too.
+		s.httpSrv.TLSConfig = cert.TLS()
+		go func() { s.serveErr <- s.httpSrv.ServeTLS(httpLn, "", "") }()
+	} else {
+		go func() { s.serveErr <- s.httpSrv.Serve(httpLn) }()
+	}
+	if redirectLn != nil {
+		s.redirectSrv = &http.Server{
+			Handler:           cert.Challenge(http.HandlerFunc(s.redirectToHTTPS)),
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		go func() { s.serveErr <- s.redirectSrv.Serve(redirectLn) }()
+	}
+	go func() {
+		defer close(s.wtDone)
+		s.serveErr <- s.wtSrv.Serve(udpConn)
+	}()
 	return s, nil
 }
+
+// redirectToHTTPS sends a plain-HTTP request to the same URL over HTTPS. The
+// port is added only when the HTTPS listener is not on 443, so the usual
+// deployment redirects to a clean https://host/path.
+func (s *Server) redirectToHTTPS(w http.ResponseWriter, r *http.Request) {
+	host := r.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if s.httpPort != 443 {
+		host = net.JoinHostPort(host, strconv.Itoa(s.httpPort))
+	}
+	http.Redirect(w, r, "https://"+host+r.URL.RequestURI(), http.StatusMovedPermanently)
+}
+
+// ReloadCert re-reads a file-mode certificate (SIGHUP), so a renewal is picked
+// up without a restart. Other modes are a no-op.
+func (s *Server) ReloadCert() error { return s.cert.Reload() }
 
 // Wait returns when either listener stops serving, with its error.
 func (s *Server) Wait() error {
@@ -205,7 +300,17 @@ func (s *Server) Wait() error {
 }
 
 func (s *Server) Close() error {
-	return errors.Join(s.wtSrv.Close(), s.httpSrv.Close(), s.udpConn.Close(), s.assets.Close())
+	// Close the socket first and wait for Serve to return: closing the
+	// WebTransport server while its own Serve is starting races inside
+	// webtransport-go (vrek iss-ag6h0a6), which a Start immediately followed
+	// by a Close reliably hits.
+	err := s.udpConn.Close()
+	<-s.wtDone
+	err = errors.Join(err, s.wtSrv.Close(), s.httpSrv.Close(), s.assets.Close())
+	if s.redirectSrv != nil {
+		err = errors.Join(err, s.redirectSrv.Close())
+	}
+	return err
 }
 
 // Metrics returns the HTTP4 counters shared by every session.
@@ -215,9 +320,9 @@ func (s *Server) ClientConfig() ClientConfig {
 	return ClientConfig{
 		WebTransportURL: s.WebTransportURL,
 		EchoURL:         strings.TrimSuffix(s.WebTransportURL, WebTransportPath) + EchoPath,
-		CertHash:        base64.StdEncoding.EncodeToString(s.cert.Hash[:]),
+		CertHash:        s.cert.CertHash(),
 		H3URL:           s.h3URL(),
-		SPKIHash:        base64.StdEncoding.EncodeToString(s.cert.SPKIHash[:]),
+		SPKIHash:        s.cert.SPKIHash(),
 		AssetPrefix:     s.assetPrefix,
 	}
 }
@@ -235,7 +340,19 @@ func (s *Server) handleConfig(w http.ResponseWriter, _ *http.Request) {
 	json.NewEncoder(w).Encode(s.ClientConfig())
 }
 
-func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	// A deployed server keeps its counters to itself: they are operational
+	// detail, and one more thing a stranger can poll.
+	switch s.metricsTo {
+	case MetricsOff:
+		http.NotFound(w, r)
+		return
+	case MetricsLocal:
+		if !isLoopbackAddr(r.RemoteAddr) {
+			http.NotFound(w, r)
+			return
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	json.NewEncoder(w).Encode(s.Metrics())
@@ -262,14 +379,18 @@ func (s *Server) upgrade(serve func(*webtransport.Session)) http.HandlerFunc {
 }
 
 func (s *Server) allowedOrigin(r *http.Request) bool {
-	return isLoopbackOrigin(r.Header.Get("Origin"), s.httpPort)
+	origin := r.Header.Get("Origin")
+	if isLoopbackOrigin(origin, s.httpScheme, s.httpPort) {
+		return true
+	}
+	return origin != "" && slices.Contains(s.origins, normaliseOrigin(origin))
 }
 
-// isLoopbackOrigin accepts only the page this server itself serves: an http
-// origin on a loopback host at the HTTP listener's port.
-func isLoopbackOrigin(origin string, httpPort int) bool {
+// isLoopbackOrigin accepts the page this server itself serves on loopback: its
+// own scheme and port, on localhost or a loopback address.
+func isLoopbackOrigin(origin, scheme string, httpPort int) bool {
 	u, err := url.Parse(origin)
-	if err != nil || u.Scheme != "http" || u.Port() != strconv.Itoa(httpPort) {
+	if err != nil || u.Scheme != scheme || u.Port() != strconv.Itoa(httpPort) {
 		return false
 	}
 	if u.Hostname() == "localhost" {
@@ -277,4 +398,42 @@ func isLoopbackOrigin(origin string, httpPort int) bool {
 	}
 	ip := net.ParseIP(u.Hostname())
 	return ip != nil && ip.IsLoopback()
+}
+
+// isLoopbackAddr reports whether a net/http RemoteAddr is a loopback client.
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// normaliseOrigins parses the configured extra origins. A typo here would
+// silently refuse every browser session, so it fails at startup instead.
+func normaliseOrigins(origins []string) ([]string, error) {
+	out := make([]string, 0, len(origins))
+	for _, o := range origins {
+		u, err := url.Parse(o)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" ||
+			u.Path != "" || u.RawQuery != "" || u.User != nil {
+			return nil, fmt.Errorf("-origin %q: want scheme://host[:port], e.g. https://demo.example", o)
+		}
+		out = append(out, normaliseOrigin(o))
+	}
+	return out, nil
+}
+
+// normaliseOrigin drops a default port, so https://h and https://h:443 match.
+func normaliseOrigin(origin string) string {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return origin
+	}
+	host := u.Hostname()
+	if port := u.Port(); port != "" && !(u.Scheme == "https" && port == "443") && !(u.Scheme == "http" && port == "80") {
+		host = net.JoinHostPort(host, port)
+	}
+	return u.Scheme + "://" + host
 }

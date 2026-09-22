@@ -7,6 +7,7 @@ import { once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { request as httpsRequest } from "node:https";
 import { createInterface } from "node:readline";
 import { chromium, type Browser } from "playwright-core";
 
@@ -71,6 +72,13 @@ export interface HarnessOptions {
    * flags.
    */
   serve?: boolean;
+  /**
+   * The server speaks HTTPS (`-cert file:...`), so Node's own fetches must
+   * accept its test certificate.
+   */
+  https?: boolean;
+  /** Extra Chrome flags, e.g. to trust a test certificate. */
+  chromeArgs?: string[];
 }
 
 /** `extraArgs` go to http4d, e.g. ["-drop", "every=7"]. */
@@ -121,9 +129,10 @@ export async function startHarness(assetsDir: string, extraArgs: string[] = [], 
       await firstLine(proxy, "impairment proxy", proxyLines);
     }
     // Use an installed Chrome rather than a Playwright-downloaded build.
-    const chromeArgs = opts.h3
-      ? [`--origin-to-force-quic-on=${new URL(ready.webtransport).host}`, `--ignore-certificate-errors-spki-list=${ready.spki}`]
-      : [];
+    const chromeArgs = [
+      ...(opts.h3 ? [`--origin-to-force-quic-on=${new URL(ready.webtransport).host}`, `--ignore-certificate-errors-spki-list=${ready.spki}`] : []),
+      ...(opts.chromeArgs ?? []),
+    ];
     browser = await chromium.launch({ channel: process.env.HTTP4_CHROME_CHANNEL ?? "chrome", headless: true, args: chromeArgs });
   } catch (e) {
     await stopServer();
@@ -135,8 +144,11 @@ export async function startHarness(assetsDir: string, extraArgs: string[] = [], 
     webtransport: ready.webtransport,
     browser,
     async metrics() {
-      const res = await fetch(ready.http + "/metrics.json");
-      return (await res.json()) as ServerMetrics;
+      // A test certificate is not in Node's trust store either.
+      const body = opts.https
+        ? await insecureGet(ready.http + "/metrics.json")
+        : await fetch(ready.http + "/metrics.json").then((r) => r.text());
+      return JSON.parse(body) as ServerMetrics;
     },
     async stop() {
       await browser.close();
@@ -152,6 +164,20 @@ async function firstLine(child: ChildProcess, name: string, lines = createInterf
     once(child, "exit").then(([code]) => Promise.reject(new Error(`${name} exited early with ${code}`))),
   ])) as [string];
   return line;
+}
+
+/** GET over https without checking the certificate, for test certificates. */
+export function insecureGet(url: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const req = httpsRequest(url, { rejectUnauthorized: false }, (res) => {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (c: string) => (body += c));
+      res.on("end", () => resolve(body));
+    });
+    req.on("error", reject);
+    req.end();
+  });
 }
 
 async function freeUdpPort(): Promise<number> {
