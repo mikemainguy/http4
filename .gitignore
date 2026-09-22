@@ -4,3 +4,7 @@
 
 # machine-local Claude Code settings
 .claude/settings.local.json
+
+# build output and dependencies
+node_modules/
+client/dist/

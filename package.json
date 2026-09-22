@@ -1,0 +1,18 @@
+{
+  "name": "http4",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild client/src/main.ts --bundle --format=esm --target=chrome120 --sourcemap --outdir=client/dist",
+    "typecheck": "tsc -p client && tsc -p tests",
+    "test:go": "cd server && go test ./...",
+    "test:echo": "npm run build && node --test tests/echo/echo.test.ts",
+    "test": "npm run typecheck && npm run test:go && npm run test:echo"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "esbuild": "^0.28.2",
+    "playwright-core": "^1.63.0",
+    "typescript": "^7.0.2"
+  }
+}
