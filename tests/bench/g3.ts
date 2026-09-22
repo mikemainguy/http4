@@ -16,6 +16,7 @@
 //
 //   npm run bench:g3 [-- --out results.json] [--conditions clean,1x50]
 //                    [--repeats 5] [--samples 500] [--rate 50] [--bg 4]
+//                    [--send-queue k]   (http4d -send-queue; negative = don't pace)
 //
 // Progress goes to stderr, one JSON object to stdout. Exits 0 whatever the
 // numbers say: this measures, it does not judge.
@@ -143,7 +144,8 @@ async function runStack(page: Page, sp: StackSpec, args: Args): Promise<StackRes
 
 async function runCondition(c: Condition, assets: AssetSet, args: Args): Promise<ConditionResult> {
   const started = performance.now();
-  const h: Harness = await startHarness(assets.dir, [], { h3: true, ...(c.impair ? { impair: c.impair } : {}) });
+  const serverArgs = args.sendQueue === undefined ? [] : ["-send-queue", String(args.sendQueue)];
+  const h: Harness = await startHarness(assets.dir, serverArgs, { h3: true, ...(c.impair ? { impair: c.impair } : {}) });
   try {
     const page = await h.browser.newPage();
     await openBench(page, h.http);
@@ -184,6 +186,7 @@ interface Args {
   samples: number;
   rate: number;
   bg: number;
+  sendQueue?: number;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -194,8 +197,10 @@ function parseArgs(argv: string[]): Args {
   const names = get("--conditions")?.split(",");
   const conditions = names ? names.map((n) => CONDITIONS.find((c) => c.name === n) ?? die(`unknown condition ${n}`)) : CONDITIONS;
   const out = get("--out");
+  const sendQueue = get("--send-queue");
   return {
     ...(out ? { out } : {}),
+    ...(sendQueue === undefined ? {} : { sendQueue: Number(sendQueue) }),
     conditions,
     repeats: Number(get("--repeats") ?? 5),
     samples: Number(get("--samples") ?? 500),

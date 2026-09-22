@@ -5,10 +5,13 @@
 // updates state; it never sends, so a slow send can't delay it. The send
 // loop picks the next packet and hands it to QUIC. QUIC's SendDatagram blocks
 // while its queue is full, which paces the send loop at the congestion
-// controller's rate.
+// controller's rate — but that queue is 32 datagrams deep and FIFO, so the
+// loop also holds off while it is deeper than SendQueueTarget, or a packet
+// picked now would leave behind bulk queued earlier (see pacer.go).
 package sender
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"log"
@@ -42,6 +45,11 @@ type Config struct {
 	// NoSeq ignores the client's HELLO, so sessions keep plain v1 DATA even
 	// when the client offers session sequence numbers.
 	NoSeq bool
+	// SendQueueTarget is how many datagrams the sender leaves sitting in
+	// QUIC's send queue ahead of the packet it picks next: 0 takes
+	// DefaultSendQueueTarget, and a negative value turns pacing off, letting
+	// the queue run as deep as QUIC allows (see pacer.go).
+	SendQueueTarget int
 }
 
 const (
@@ -82,6 +90,7 @@ func Serve(ctx context.Context, conn Conn, cfg Config) {
 		maxDatagram: cfg.InitialMaxDatagram,
 		now:         time.Now,
 	}
+	s.pacer.target = cmp.Or(cfg.SendQueueTarget, DefaultSendQueueTarget)
 	if cfg.NewDropper != nil {
 		s.drop = cfg.NewDropper()
 	}
@@ -124,6 +133,8 @@ type session struct {
 	m    *Metrics
 	now  func() time.Time
 	drop Dropper // nil unless injecting loss; used by the send loop only
+
+	pacer pacer // send loop only: keeps QUIC's send queue shallow
 
 	mu          sync.Mutex
 	rpcs        map[wire.RPCID]*rpc
@@ -326,6 +337,9 @@ func (s *session) sendLoop(ctx context.Context) {
 			s.evictIdle()
 		default:
 		}
+		if !s.pace(ctx) {
+			return
+		}
 		s.mu.Lock()
 		w, ok := s.pick()
 		s.mu.Unlock()
@@ -342,6 +356,31 @@ func (s *session) sendLoop(ctx context.Context) {
 		if !s.send(ctx, w) {
 			return
 		}
+	}
+}
+
+// pace holds off until QUIC's send queue is shallow enough that the packet
+// picked next won't sit behind bulk queued earlier. It returns false once the
+// session is over. A wake re-checks rather than waiting the estimate out: by
+// then the queue has often drained already.
+func (s *session) pace(ctx context.Context) bool {
+	for {
+		d := s.pacer.wait(s.now())
+		if d <= 0 {
+			return true
+		}
+		s.m.PacedWaits.Add(1)
+		start := s.now()
+		timer := time.NewTimer(d)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
+		case <-s.wake:
+			timer.Stop()
+		}
+		s.m.PacedWaitMicros.Add(s.now().Sub(start).Microseconds())
 	}
 }
 
@@ -453,7 +492,7 @@ func (s *session) send(ctx context.Context, w work) bool {
 		s.m.DroppedData.Add(1)
 	} else if isMeta && s.drop != nil && s.drop(DropInfo{Meta: true, Resend: w.r.metaSent > 0}) {
 		s.m.DroppedMeta.Add(1)
-	} else if err := s.conn.SendDatagram(b); err != nil {
+	} else if err := s.transmit(b); err != nil {
 		var tooLarge *quic.DatagramTooLargeError
 		if errors.As(err, &tooLarge) && isData {
 			// Nothing was sent and nothing was recorded, so the same work is
@@ -510,6 +549,25 @@ func (s *session) send(ctx context.Context, w work) bool {
 	s.m.DataPackets.Add(1)
 	s.m.DataBytes.Add(int64(len(d.Payload)))
 	return true
+}
+
+// transmit hands one datagram to QUIC, timing the handover. A handover that
+// waits means QUIC's queue was full and one datagram left to make room, which
+// is the pacer's only view of how fast the wire is draining.
+func (s *session) transmit(b []byte) error {
+	start := s.now()
+	err := s.conn.SendDatagram(b)
+	at := s.now()
+	if err != nil {
+		return err
+	}
+	blocked := at.Sub(start) >= pacerBlocked
+	if blocked {
+		s.m.SendBlocked.Add(1)
+	}
+	s.pacer.sent(at, blocked)
+	s.m.PacerIntervalUs.Store(s.pacer.interval.Microseconds())
+	return nil
 }
 
 func (w work) dropInfo(d *wire.Data) DropInfo {

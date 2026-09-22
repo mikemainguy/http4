@@ -24,6 +24,11 @@ type Metrics struct {
 	SeqResends       atomic.Int64 // RESEND_SEQ packets received
 	SeqResendMisses  atomic.Int64 // sequence numbers asked for that the ring no longer held
 	SeqResendRepeats atomic.Int64 // sequence numbers asked for again after they were already resent
+	// Keeping QUIC's send queue shallow (pacer):
+	SendBlocked     atomic.Int64 // sends that waited because QUIC's queue was full
+	PacedWaits      atomic.Int64 // times the send loop held off to let the queue drain
+	PacedWaitMicros atomic.Int64 // total time it held off
+	PacerIntervalUs atomic.Int64 // last estimated time between departures, 0 while unmeasured
 }
 
 // Snapshot is Metrics as plain values, for JSON.
@@ -47,6 +52,10 @@ type Snapshot struct {
 	SeqResends       int64 `json:"seq_resends"`
 	SeqResendMisses  int64 `json:"seq_resend_misses"`
 	SeqResendRepeats int64 `json:"seq_resend_repeats"`
+	SendBlocked      int64 `json:"send_blocked"`
+	PacedWaits       int64 `json:"paced_waits"`
+	PacedWaitMicros  int64 `json:"paced_wait_micros"`
+	PacerIntervalUs  int64 `json:"pacer_interval_us"`
 }
 
 func (m *Metrics) Snapshot() Snapshot {
@@ -70,5 +79,9 @@ func (m *Metrics) Snapshot() Snapshot {
 		SeqResends:       m.SeqResends.Load(),
 		SeqResendMisses:  m.SeqResendMisses.Load(),
 		SeqResendRepeats: m.SeqResendRepeats.Load(),
+		SendBlocked:      m.SendBlocked.Load(),
+		PacedWaits:       m.PacedWaits.Load(),
+		PacedWaitMicros:  m.PacedWaitMicros.Load(),
+		PacerIntervalUs:  m.PacerIntervalUs.Load(),
 	}
 }

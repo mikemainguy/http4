@@ -59,6 +59,7 @@ func parseServe(args []string, out io.Writer) (server.Config, error) {
 	drop := fs.String("drop", "", "drop outgoing DATA to simulate loss: a `spec` like every=7,packet0,final,rate=0.05,seed=1")
 	advertiseWT := fs.String("advertise-wt", "", "advertise this `host:port` for WebTransport, e.g. an impairment proxy")
 	noSeq := fs.Bool("no-seq", false, "don't negotiate session sequence numbers (wire v2); send plain v1 DATA to every client")
+	sendQueue := fs.Int("send-queue", 0, "datagrams left in QUIC's send queue ahead of the sender's next pick (0 = default, negative = don't pace)")
 	fs.Usage = func() {
 		fmt.Fprint(out, serveUsage, "\nFlags:\n")
 		printFlags(fs, out, false)
@@ -107,18 +108,19 @@ func parseServe(args []string, out io.Writer) (server.Config, error) {
 		fmt.Fprintf(out, "http4d serve: WARNING: -cert %s with loopback -http/-wt addresses; a deployment wants -http :443 -wt :443\n", mode.Kind)
 	}
 	return server.Config{
-		HTTPAddr:     *httpAddr,
-		WTAddr:       *wtAddr,
-		SiteDir:      site,
-		ClientFS:     client,
-		NoH3:         !*h3,
-		DropSpec:     *drop,
-		AdvertiseWT:  *advertiseWT,
-		NoSeq:        *noSeq,
-		Cert:         mode,
-		Origins:      origins,
-		RedirectAddr: redirectAddr,
-		Metrics:      access,
+		HTTPAddr:        *httpAddr,
+		WTAddr:          *wtAddr,
+		SiteDir:         site,
+		ClientFS:        client,
+		NoH3:            !*h3,
+		DropSpec:        *drop,
+		AdvertiseWT:     *advertiseWT,
+		NoSeq:           *noSeq,
+		SendQueueTarget: *sendQueue,
+		Cert:            mode,
+		Origins:         origins,
+		RedirectAddr:    redirectAddr,
+		Metrics:         access,
 	}, nil
 }
 
