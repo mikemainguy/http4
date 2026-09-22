@@ -8,7 +8,9 @@
 //     page → SW on that port: { state: "connecting" } at once, then
 //     { state: "ready", ... } when its session is up (or known unavailable)
 //   SW → page  { http4: "serve", url, method } + port
-//     page → SW on that port: a ServeReply, with the body transferred
+//     page → SW on that port: a ServeReply, with the body transferred (a
+//     streaming body is itself a transferred ReadableStream, so the worker's
+//     Response streams on to the page as the transfer arrives)
 //   page → SW  { http4: "report", all? } + port
 //     SW → page on that port: SwRequestReport[]
 //   SW → page  { http4: "log", entry }   (no port)
@@ -58,9 +60,20 @@ export type HelloReply =
       assetPrefix: string | null;
     };
 
-/** Http4Outcome with its body as a transferable ArrayBuffer. */
+/**
+ * Http4Outcome with its body in a form postMessage can transfer: a whole
+ * ArrayBuffer, or a ReadableStream while the transfer is still arriving.
+ */
 export type ServeReply =
-  | { transport: "http4"; status: number; headers: [string, string][]; body: ArrayBuffer | null }
+  | {
+      transport: "http4";
+      status: number;
+      headers: [string, string][];
+      body: ArrayBuffer | null;
+      stream?: ReadableStream<Uint8Array>;
+      /** Declared body length, for the worker's report, when `stream` is set. */
+      length?: number;
+    }
   | { transport: "fallback" | "platform"; reason: string };
 
 /** One request the worker saw, and how it was served. */
@@ -79,14 +92,18 @@ export interface SwRequestReport {
 }
 
 /** A ServeReply for an outcome. The body's buffer is transferred when it is the whole buffer, else copied. */
-export function serveReply(o: Http4Outcome): { reply: ServeReply; transfer: ArrayBuffer[] } {
+export function serveReply(o: Http4Outcome): { reply: ServeReply; transfer: Transferable[] } {
   if (o.transport !== "http4") return { reply: o, transfer: [] };
+  if (o.stream) {
+    const { status, headers, length } = o;
+    return { reply: { transport: "http4", status, headers, body: null, stream: o.stream, ...(length !== undefined ? { length } : {}) }, transfer: [o.stream] };
+  }
   let body: ArrayBuffer | null = null;
   if (o.body) {
     const whole = o.body.byteOffset === 0 && o.body.byteLength === o.body.buffer.byteLength;
     body = whole ? o.body.buffer : o.body.slice().buffer;
   }
-  return { reply: { ...o, body }, transfer: body ? [body] : [] };
+  return { reply: { ...o, body, stream: undefined }, transfer: body ? [body] : [] };
 }
 
 /** The parts of a FetchEvent the interception decision looks at. */

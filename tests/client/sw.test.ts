@@ -37,10 +37,19 @@ test("a reply transfers the body's own buffer and copies a view into a larger on
   view.set([7, 8, 9]);
   const b = serveReply({ transport: "http4", status: 200, headers: [], body: view });
   assert.notEqual(b.transfer[0], view.buffer, "a view is copied, so the rest of its buffer isn't sent");
-  assert.deepEqual([...new Uint8Array(b.transfer[0]!)], [7, 8, 9]);
+  assert.deepEqual([...new Uint8Array(b.transfer[0] as ArrayBuffer)], [7, 8, 9]);
 
   const none = serveReply({ transport: "fallback", reason: "x" });
   assert.deepEqual(none, { reply: { transport: "fallback", reason: "x" }, transfer: [] });
+});
+
+test("a streaming reply transfers the stream itself, with the length for the report", () => {
+  const stream = new ReadableStream<Uint8Array<ArrayBuffer>>();
+  const { reply, transfer } = serveReply({ transport: "http4", status: 200, headers: [["content-length", "9"]], body: null, stream, length: 9 });
+  assert.deepEqual(transfer, [stream], "the stream is what crosses to the worker");
+  assert.equal(reply.transport === "http4" && reply.stream, stream);
+  assert.equal(reply.transport === "http4" && reply.body, null, "no buffer alongside the stream");
+  assert.equal(reply.transport === "http4" && reply.length, 9);
 });
 
 test('asset prefix "/" (http4d serve) maps every same-origin path to itself without the leading slash', () => {

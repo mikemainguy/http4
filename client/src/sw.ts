@@ -111,8 +111,11 @@ async function serve(req: Request, clientId: string): Promise<Response> {
     return network("fallback", `forwarding failed: ${err instanceof Error ? err.message : String(err)}`);
   }
   if (reply.transport !== "http4") return network(reply.transport, reply.reason);
-  record(req, clientId, "http4", reply.status, reply.body?.byteLength ?? 0, performance.now() - t0);
-  return new Response(reply.body, { status: reply.status, headers: reply.headers });
+  // A streamed body is recorded at its declared length: the Response is
+  // handed to the page now, while its bytes are still arriving.
+  const bytes = reply.stream ? (reply.length ?? null) : (reply.body?.byteLength ?? 0);
+  record(req, clientId, "http4", reply.status, bytes, performance.now() - t0);
+  return new Response(reply.stream ?? reply.body, { status: reply.status, headers: reply.headers });
 }
 
 /** Ask a tab whether it can serve requests; remember its answer for the tab's lifetime. */
