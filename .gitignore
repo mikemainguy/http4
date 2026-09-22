@@ -23,3 +23,7 @@ testdata/assets/*
 
 # agent worktrees (Claude Code)
 .claude/worktrees/
+
+# demo site: generated gallery images (examples/demo-site/gen-images.ts) and the built server
+examples/demo-site/img/
+bin/

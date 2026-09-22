@@ -9,7 +9,7 @@
 // that are down, and failed transfers.
 
 import {
-  isSwMessage, leaveToNetwork, type HelloReply, type ServeMsg, type ServeReply, type SwRequestReport,
+  isSwMessage, leaveToNetwork, type HelloReply, type LogMsg, type ServeMsg, type ServeReply, type SwRequestReport,
 } from "./swproto.ts";
 import type { Transport } from "./fetcher.ts";
 
@@ -162,6 +162,8 @@ function record(
   if (reason !== undefined) r.reason = reason;
   log.push(r);
   if (log.length > REPORT_LIMIT) log.shift();
+  // Mirror it to the tab: this log dies with the worker, the tab's copy doesn't.
+  if (clientId) void sw.clients.get(clientId).then((c) => c?.postMessage({ http4: "log", entry: r } satisfies LogMsg, []));
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));

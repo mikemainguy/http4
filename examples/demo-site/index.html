@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <!-- The only HTTP4 line: one classic script, first in <head>. -->
+  <script src="/http4/auto.js"></script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>Field Notes · HTTP4 demo</title>
+  <!-- Relative URLs throughout, so the same page also loads from /h3/ for the HTTP/3 comparison. -->
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header class="masthead">
+    <h1>Field Notes</h1>
+    <p class="tagline">Twelve landscapes from a year of walking, and what was learned carrying them home.</p>
+    <nav class="modes" id="modes" aria-label="Transport"></nav>
+  </header>
+
+  <main>
+    <article class="intro">
+      <h2>On carrying pictures</h2>
+      <p>Every photograph on this page is a few hundred kilobytes of colour that has to cross the network
+        before you can see it. The stylesheet that lays the page out is a few kilobytes; the notes and comments
+        below come from small JSON calls. A fair network gives them all an equal share and lets the small things
+        wait behind the big ones. This page is served over <strong>HTTP4</strong>, where the browser grants the
+        server permission to send, shortest job first, so the small things arrive first.</p>
+      <p>Open the panel in the corner to watch it happen: every resource, how it travelled, and the order it
+        finished in.</p>
+    </article>
+
+    <section class="gallery" aria-label="Gallery">
+      <figure><img src="img/harbor.png" width="720" height="480" alt="Harbor at dawn"><figcaption>Harbor</figcaption></figure>
+      <figure><img src="img/dunes.png" width="360" height="240" alt="Wind-shaped dunes"><figcaption>Dunes</figcaption></figure>
+      <figure><img src="img/forest.png" width="600" height="400" alt="Old forest"><figcaption>Forest</figcaption></figure>
+      <figure><img src="img/glacier.png" width="480" height="320" alt="Glacier tongue"><figcaption>Glacier</figcaption></figure>
+      <figure><img src="img/canyon.png" width="540" height="360" alt="Red canyon"><figcaption>Canyon</figcaption></figure>
+      <figure><img src="img/meadow.png" width="300" height="200" alt="Meadow in June"><figcaption>Meadow</figcaption></figure>
+      <figure><img src="img/reef.png" width="660" height="440" alt="Shallow reef"><figcaption>Reef</figcaption></figure>
+      <figure><img src="img/tundra.png" width="420" height="280" alt="Autumn tundra"><figcaption>Tundra</figcaption></figure>
+      <figure><img src="img/lagoon.png" width="768" height="512" alt="Lagoon at low tide"><figcaption>Lagoon</figcaption></figure>
+      <figure><img src="img/volcano.png" width="450" height="300" alt="Volcano ridge"><figcaption>Volcano</figcaption></figure>
+      <figure><img src="img/prairie.png" width="390" height="260" alt="Prairie storm"><figcaption>Prairie</figcaption></figure>
+      <figure><img src="img/aurora.png" width="570" height="380" alt="Aurora over a lake"><figcaption>Aurora</figcaption></figure>
+    </section>
+
+    <div class="columns">
+      <section class="notes">
+        <h2>Latest notes</h2>
+        <ul id="articles"><li class="loading">Loading…</li></ul>
+      </section>
+      <section class="comments">
+        <h2>Comments</h2>
+        <ul id="comments"><li class="loading">Loading…</li></ul>
+      </section>
+    </div>
+    <p class="stats" id="stats"></p>
+  </main>
+
+  <aside class="panel" id="panel" aria-label="Protocol panel"></aside>
+</body>
+</html>

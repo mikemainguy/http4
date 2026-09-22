@@ -11,6 +11,9 @@
 //     page → SW on that port: a ServeReply, with the body transferred
 //   page → SW  { http4: "report", all? } + port
 //     SW → page on that port: SwRequestReport[]
+//   SW → page  { http4: "log", entry }   (no port)
+//     every report entry, as it is recorded, so the tab keeps its own copy
+//     that survives Chrome stopping the idle worker (fnd-f844ews)
 
 import type { Http4Outcome, Transport } from "./fetcher.ts";
 
@@ -37,7 +40,12 @@ export interface ReportMsg {
   all?: boolean;
 }
 
-export type SwMessage = HelloMsg | ServeMsg | ReportMsg;
+export interface LogMsg {
+  http4: "log";
+  entry: SwRequestReport;
+}
+
+export type SwMessage = HelloMsg | ServeMsg | ReportMsg | LogMsg;
 
 export type HelloReply =
   | { state: "connecting" }

@@ -1,0 +1,24 @@
+#!/bin/sh
+# Build everything the demo site needs, then print how to run it. This script
+# never starts the server: run the printed command yourself, and stop it with
+# Ctrl-C when you're done.
+#
+#   npm run demo
+set -eu
+cd "$(dirname "$0")/.."
+
+npm run build --silent >/dev/null 2>&1 || npm run build   # client bundle, embedded into the binary (rerun loudly on failure)
+node examples/demo-site/gen-images.ts        # the gallery's generated images
+(cd server && go build -o ../bin/http4d ./cmd/http4d)
+
+cat <<'EOF'
+
+Built bin/http4d. Start the demo server yourself:
+
+  bin/http4d serve examples/demo-site          # HTTP4, with a plain-HTTP switch
+  bin/http4d serve -h3 examples/demo-site      # also the HTTP/3 comparison (see README)
+
+then open http://127.0.0.1:8080/ in Chrome, reload once (the first visit
+installs the Service Worker), and open the panel in the corner.
+Details: examples/demo-site/README.md
+EOF
