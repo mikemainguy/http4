@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "generator": "ChaCha8Rand seeded with SHA-256(\"http4-fixture/v1:\" + name); regenerate with scripts/gen-fixtures",
+  "assets": [
+    {
+      "name": "edge-0.bin",
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "edge-1007.bin",
+      "size": 1007,
+      "sha256": "8a9b528677e2df9407bdbdb3f73a79802f81f4f091e2f327eb8aa265df63b2d8"
+    },
+    {
+      "name": "edge-1008.bin",
+      "size": 1008,
+      "sha256": "3b2e67ece1fbb87c30717727ed37643d7c54fd5e06ed14103ca92128a3f1863a"
+    },
+    {
+      "name": "edge-1183.bin",
+      "size": 1183,
+      "sha256": "36135e03c351b5b511d61c752181370abc9d65daa2f6cc7cf4ef6c7d89afe31a"
+    },
+    {
+      "name": "edge-1184.bin",
+      "size": 1184,
+      "sha256": "319d024be33c7b656380d28daa3545aa5a3109f20adea0a1d76e095bb8fe2195"
+    },
+    {
+      "name": "1k.bin",
+      "size": 1024,
+      "sha256": "78aab8c35b7b1ed2fb0982ccce32bc31a33b0458e25e43a05a1e3f571cd19fed"
+    },
+    {
+      "name": "4k.bin",
+      "size": 4096,
+      "sha256": "30d88bee67c14cfa65dc851a1905f757dd1d24ac6cd629b09a86aad4f537baf9"
+    },
+    {
+      "name": "64k.bin",
+      "size": 65536,
+      "sha256": "696c8e96568cf5acc9eb505f05d366912ef70cec7ae2338871b596aca3066538"
+    },
+    {
+      "name": "1m.bin",
+      "size": 1048576,
+      "sha256": "6ebc03703fb717f411c78d8608778464255e08ef7e6a10fddc65a06d401d13d7"
+    },
+    {
+      "name": "10m.bin",
+      "size": 10485760,
+      "sha256": "16c4da9958aa2ff4aad473a0bdd7f084e21f0504c246d610d67aef7e57e1d8cc"
+    },
+    {
+      "name": "50m.bin",
+      "size": 52428800,
+      "sha256": "6140eaea4e1801e2756730c9913fb26c16a603ca7ea99a0cfc7e79aaa6a0230a"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+#!/bin/sh
+# Generate (or with --check, verify) the integrity suite's deterministic
+# asset pool in testdata/assets. The data files are gitignored; manifest.json
+# is committed and must not change when this is re-run.
+set -eu
+cd "$(dirname "$0")/../server"
+case "${1:-}" in
+  --check) exec go run ./cmd/gen-fixtures -check -out ../testdata/assets ;;
+  "") exec go run ./cmd/gen-fixtures -out ../testdata/assets ;;
+  *) echo "usage: $0 [--check]" >&2; exit 2 ;;
+esac

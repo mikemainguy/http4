@@ -11,3 +11,7 @@ client/dist/
 
 # JetBrains IDE project files
 .idea/
+
+# generated fixtures (scripts/gen-fixtures); the manifest is committed
+testdata/assets/*
+!testdata/assets/manifest.json
