@@ -19,12 +19,13 @@ func main() {
 	static := flag.String("static", "client", "directory served at /")
 	assets := flag.String("assets", "testdata/assets", "directory HTTP4 requests are served from")
 	drop := flag.String("drop", "", "TESTING ONLY: drop outgoing DATA to simulate loss, e.g. every=7,packet0,final,rate=0.05,seed=1")
+	assetPrefix := flag.String("asset-prefix", server.DefaultAssetPrefix, "HTTP path the asset pool is also served under, for clients falling back from HTTP4")
 	advertiseWT := flag.String("advertise-wt", "", "host:port to advertise for WebTransport instead of -wt's, e.g. an impairment proxy in front of it")
 	flag.Parse()
 
 	srv, err := server.Start(server.Config{
 		HTTPAddr: *httpAddr, WTAddr: *wtAddr, StaticDir: *static, AssetsDir: *assets,
-		DropSpec: *drop, AdvertiseWT: *advertiseWT,
+		DropSpec: *drop, AdvertiseWT: *advertiseWT, AssetPrefix: *assetPrefix,
 	})
 	if err != nil {
 		log.Fatal(err)

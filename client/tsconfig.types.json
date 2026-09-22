@@ -1,0 +1,14 @@
+{
+  // Emits the library's .d.ts files (client/dist/types) for the public entry.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "rootDir": "src",
+    "outDir": "dist/types",
+    "rewriteRelativeImportExtensions": true
+  },
+  "include": [],
+  "files": ["src/index.ts"]
+}
