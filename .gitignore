@@ -8,3 +8,6 @@
 # build output and dependencies
 node_modules/
 client/dist/
+
+# JetBrains IDE project files
+.idea/

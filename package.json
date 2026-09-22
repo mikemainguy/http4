@@ -7,7 +7,8 @@
     "typecheck": "tsc -p client && tsc -p tests",
     "test:go": "cd server && go test ./...",
     "test:echo": "npm run build && node --test tests/echo/echo.test.ts",
-    "test": "npm run typecheck && npm run test:go && npm run test:echo"
+    "test": "npm run typecheck && npm run test:go && npm run test:wire && npm run test:echo",
+    "test:wire": "node --test tests/wire/wire.test.ts"
   },
   "devDependencies": {
     "@types/node": "^26.6.2",
