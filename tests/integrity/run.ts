@@ -15,30 +15,23 @@
 //
 //   npm run integrity [-- --out results.json]
 //   INTEGRITY_LOSSY_DROP=<http4d -drop spec> npm run integrity
-import { execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
-import path from "node:path";
-import { startHarness, root, type ServerMetrics } from "../support/harness.ts";
-import type { Page } from "playwright-core";
-import { fetchInPage, openPage, type Fetched } from "../support/page.ts";
+import { writeFileSync } from "node:fs";
+import { startHarness, type ServerMetrics } from "../support/harness.ts";
+import { openPage } from "../support/page.ts";
+import { ensureFixtures, fetchBy, FIXTURES, Judge, log, type Failure, type Manifest } from "../support/suite.ts";
 
-const FIXTURES = path.join(root, "testdata/assets");
 const PASSES = [
   { name: "clean", drop: "" },
   // INTEGRITY_LOSSY_DROP overrides the lossy pass, e.g. to prove the suite fails.
   { name: "lossy", drop: process.env.INTEGRITY_LOSSY_DROP ?? "rate=0.01,seed=1,packet0,final" },
 ];
 
-interface Manifest {
-  assets: { name: string; size: number; sha256: string }[];
-}
-
 interface PassResult {
   name: string;
   drop: string;
   fetches: number;
   intact: number;
-  failures: { name: string; phase: string; reason: string }[];
+  failures: Failure[];
   ungrantedBytes: number;
   seconds: { single: number; concurrent: number };
   server: ServerMetrics;
@@ -46,53 +39,8 @@ interface PassResult {
 
 const PASS_TIMEOUT_MS = 1000 * Number(process.env.INTEGRITY_PASS_TIMEOUT_S ?? 120);
 
-const log = (s: string) => process.stderr.write(s + "\n");
-
-/** fetchInPage, or null if the pass deadline passes first. */
-async function fetchBy(deadline: number, page: Page, names: string[]): Promise<Fetched[] | null> {
-  const left = deadline - performance.now();
-  if (left <= 0) return null;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<null>((r) => (timer = setTimeout(() => r(null), left)));
-  try {
-    return await Promise.race([fetchInPage(page, names).then((r) => r.results), timeout]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function ensureFixtures(): Manifest {
-  const script = path.join(root, "scripts/gen-fixtures");
-  try {
-    execFileSync(script, ["--check"], { stdio: ["ignore", "ignore", "pipe"] });
-  } catch {
-    log("fixtures missing or stale; generating");
-    execFileSync(script, [], { stdio: ["ignore", "inherit", "inherit"] });
-  }
-  return JSON.parse(readFileSync(path.join(FIXTURES, "manifest.json"), "utf8")) as Manifest;
-}
-
 async function runPass(manifest: Manifest, pass: (typeof PASSES)[number]): Promise<PassResult> {
-  const expected = new Map(manifest.assets.map((a) => [a.name, a]));
-  const failures: PassResult["failures"] = [];
-  let fetches = 0;
-  let intact = 0;
-  const judge = (phase: string, names: string[], results: Fetched[] | null) => {
-    if (results === null) {
-      for (const name of names) {
-        fetches++;
-        failures.push({ name, phase, reason: `pass deadline (${PASS_TIMEOUT_MS / 1000} s) exceeded` });
-      }
-      return;
-    }
-    for (const r of results) {
-      fetches++;
-      const want = expected.get(r.name)!;
-      const reason = !r.ok ? r.error! : r.size !== want.size ? `size ${r.size} != ${want.size}` : r.sha256 !== want.sha256 ? "SHA-256 mismatch" : null;
-      if (reason) failures.push({ name: r.name, phase, reason });
-      else intact++;
-    }
-  };
+  const j = new Judge(manifest, `pass deadline (${PASS_TIMEOUT_MS / 1000} s) exceeded`);
 
   const h = await startHarness(FIXTURES, pass.drop ? ["-drop", pass.drop] : []);
   try {
@@ -102,14 +50,15 @@ async function runPass(manifest: Manifest, pass: (typeof PASSES)[number]): Promi
     const deadline = performance.now() + PASS_TIMEOUT_MS;
 
     let t0 = performance.now();
-    for (const name of names) judge("single", [name], await fetchBy(deadline, page, [name]));
+    for (const name of names) j.judge("single", [name], await fetchBy(deadline, page, [name]));
     const single = (performance.now() - t0) / 1000;
 
     t0 = performance.now();
-    judge("concurrent", names, await fetchBy(deadline, page, names));
+    j.judge("concurrent", names, await fetchBy(deadline, page, names));
     const concurrent = (performance.now() - t0) / 1000;
 
     const server = await h.metrics();
+    const { fetches, intact, failures } = j;
     return { name: pass.name, drop: pass.drop, fetches, intact, failures, ungrantedBytes: server.ungranted_bytes_sent, seconds: { single, concurrent }, server };
   } finally {
     await h.stop();

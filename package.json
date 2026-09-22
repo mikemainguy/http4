@@ -12,7 +12,8 @@
     "test:client": "node --test \"tests/client/*.test.ts\"",
     "test:browser": "npm run build && node --test --test-concurrency=1 $(ls tests/*/*.test.ts | grep -v -e ^tests/client/ -e ^tests/wire/)",
     "fixtures": "scripts/gen-fixtures",
-    "integrity": "npm run build && node tests/integrity/run.ts"
+    "integrity": "npm run build && node tests/integrity/run.ts",
+    "matrix": "npm run build && node tests/matrix/run.ts"
   },
   "devDependencies": {
     "@types/node": "^26.6.2",
