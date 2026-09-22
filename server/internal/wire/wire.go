@@ -20,6 +20,10 @@ const (
 	TypeResend Type = 0x04
 	TypeError  Type = 0x05
 	TypeMeta   Type = 0x06
+	// v2, negotiated per session (docs/wire-format.md, "Capabilities"):
+	TypeHello     Type = 0x07
+	TypeDataSeq   Type = 0x08
+	TypeResendSeq Type = 0x09
 )
 
 func (t Type) String() string {
@@ -36,6 +40,12 @@ func (t Type) String() string {
 		return "ERROR"
 	case TypeMeta:
 		return "META"
+	case TypeHello:
+		return "HELLO"
+	case TypeDataSeq:
+		return "DATA_SEQ"
+	case TypeResendSeq:
+		return "RESEND_SEQ"
 	}
 	return fmt.Sprintf("Type(0x%02x)", uint8(t))
 }
@@ -56,6 +66,16 @@ const (
 	resendLen     = HeaderLen + 8
 	errorLen      = HeaderLen + 1
 	metaFixedLen  = HeaderLen + 1 // + count
+	helloLen      = HeaderLen + 4 // + capabilities
+	// DataSeqHeaderLen is DATA's header plus the session sequence number.
+	DataSeqHeaderLen = DataHeaderLen + 4
+	resendSeqLen     = HeaderLen + 8
+)
+
+// Capability bits a client offers in HELLO. Unknown bits are ignored, so a
+// later version can add more without breaking older servers.
+const (
+	CapSessionSeq uint32 = 1 << 0 // server sends DATA_SEQ and accepts RESEND_SEQ
 )
 
 // MetaNames are the only field names a META packet may carry, in the order
@@ -67,6 +87,11 @@ var MetaNames = []string{"content-type", "etag", "last-modified", "cache-control
 // of maxDatagramSize bytes.
 func MaxPayload(maxDatagramSize int) int {
 	return max(0, maxDatagramSize-DataHeaderLen)
+}
+
+// MaxPayloadSeq is MaxPayload for DATA_SEQ, whose header is 4 bytes longer.
+func MaxPayloadSeq(maxDatagramSize int) int {
+	return max(0, maxDatagramSize-DataSeqHeaderLen)
 }
 
 // RPCID correlates every packet of one request/response.
@@ -112,6 +137,28 @@ type Meta struct {
 	Fields []Field
 }
 
+// Hello offers capabilities for the session (v2). Its RPCID is unused and
+// sent as 0.
+type Hello struct {
+	RPCID RPCID
+	Caps  uint32
+}
+
+// DataSeq is DATA plus a session-wide sequence number (v2). Every DATA_SEQ
+// the server sends in a session, across all RPCs and including resends, takes
+// the next number, so a missing number means exactly one lost datagram.
+type DataSeq struct {
+	Data
+	Seq uint32
+}
+
+// ResendSeq asks the server to send again whatever it sent with sequence
+// numbers [Start, End) (v2). Its RPCID is unused and sent as 0.
+type ResendSeq struct {
+	RPCID      RPCID
+	Start, End uint32
+}
+
 type Field struct {
 	Name, Value string
 }
@@ -126,18 +173,23 @@ func (p *Meta) Get(name string) (string, bool) {
 	return "", false
 }
 
-func (p *Req) Type() Type    { return TypeReq }
-func (p *Data) Type() Type   { return TypeData }
-func (p *Grant) Type() Type  { return TypeGrant }
-func (p *Resend) Type() Type { return TypeResend }
-func (p *Error) Type() Type  { return TypeError }
-func (p *Meta) Type() Type   { return TypeMeta }
-func (p *Req) RPC() RPCID    { return p.RPCID }
-func (p *Data) RPC() RPCID   { return p.RPCID }
-func (p *Grant) RPC() RPCID  { return p.RPCID }
-func (p *Resend) RPC() RPCID { return p.RPCID }
-func (p *Error) RPC() RPCID  { return p.RPCID }
-func (p *Meta) RPC() RPCID   { return p.RPCID }
+func (p *Req) Type() Type       { return TypeReq }
+func (p *Data) Type() Type      { return TypeData }
+func (p *Grant) Type() Type     { return TypeGrant }
+func (p *Resend) Type() Type    { return TypeResend }
+func (p *Error) Type() Type     { return TypeError }
+func (p *Meta) Type() Type      { return TypeMeta }
+func (p *Hello) Type() Type     { return TypeHello }
+func (p *DataSeq) Type() Type   { return TypeDataSeq }
+func (p *ResendSeq) Type() Type { return TypeResendSeq }
+func (p *Req) RPC() RPCID       { return p.RPCID }
+func (p *Data) RPC() RPCID      { return p.RPCID }
+func (p *Grant) RPC() RPCID     { return p.RPCID }
+func (p *Resend) RPC() RPCID    { return p.RPCID }
+func (p *Error) RPC() RPCID     { return p.RPCID }
+func (p *Meta) RPC() RPCID      { return p.RPCID }
+func (p *Hello) RPC() RPCID     { return p.RPCID }
+func (p *ResendSeq) RPC() RPCID { return p.RPCID }
 
 // ErrMalformed is wrapped by every decode and encode rejection.
 var ErrMalformed = errors.New("wire: malformed packet")
@@ -207,6 +259,40 @@ func Decode(b []byte) (Packet, error) {
 			return nil, malformed("ERROR is %d bytes, want %d", len(b), errorLen)
 		}
 		return &Error{RPCID: id, Code: ErrorCode(b[9])}, nil
+
+	case TypeHello:
+		if len(b) != helloLen {
+			return nil, malformed("HELLO is %d bytes, want %d", len(b), helloLen)
+		}
+		return &Hello{RPCID: id, Caps: binary.BigEndian.Uint32(b[9:13])}, nil
+
+	case TypeDataSeq:
+		if len(b) < DataSeqHeaderLen {
+			return nil, malformed("DATA_SEQ is %d bytes, need at least %d", len(b), DataSeqHeaderLen)
+		}
+		p := &DataSeq{
+			Data: Data{
+				RPCID:     id,
+				TotalSize: binary.BigEndian.Uint32(b[9:13]),
+				Offset:    binary.BigEndian.Uint32(b[13:17]),
+				Payload:   b[21:],
+			},
+			Seq: binary.BigEndian.Uint32(b[17:21]),
+		}
+		if err := p.checkBounds(); err != nil {
+			return nil, err
+		}
+		return p, nil
+
+	case TypeResendSeq:
+		if len(b) != resendSeqLen {
+			return nil, malformed("RESEND_SEQ is %d bytes, want %d", len(b), resendSeqLen)
+		}
+		p := &ResendSeq{RPCID: id, Start: binary.BigEndian.Uint32(b[9:13]), End: binary.BigEndian.Uint32(b[13:17])}
+		if p.Start >= p.End {
+			return nil, malformed("RESEND_SEQ range [%d, %d) is empty", p.Start, p.End)
+		}
+		return p, nil
 
 	case TypeMeta:
 		if len(b) < metaFixedLen {
@@ -334,6 +420,22 @@ func Append(dst []byte, p Packet) ([]byte, error) {
 			dst = append(dst, f.Value...)
 		}
 		return dst, nil
+	case *Hello:
+		return binary.BigEndian.AppendUint32(dst, p.Caps), nil
+	case *DataSeq:
+		if err := p.checkBounds(); err != nil {
+			return nil, err
+		}
+		dst = binary.BigEndian.AppendUint32(dst, p.TotalSize)
+		dst = binary.BigEndian.AppendUint32(dst, p.Offset)
+		dst = binary.BigEndian.AppendUint32(dst, p.Seq)
+		return append(dst, p.Payload...), nil
+	case *ResendSeq:
+		if p.Start >= p.End {
+			return nil, malformed("RESEND_SEQ range [%d, %d) is empty", p.Start, p.End)
+		}
+		dst = binary.BigEndian.AppendUint32(dst, p.Start)
+		return binary.BigEndian.AppendUint32(dst, p.End), nil
 	}
 	return nil, fmt.Errorf("wire: cannot encode %T", p)
 }

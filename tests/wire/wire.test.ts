@@ -34,6 +34,15 @@ function packetFromJSON(m: Record<string, string | number | [string, string][]>)
       return { type: "ERROR", rpcId, code: m.code as number };
     case "META":
       return { type: "META", rpcId, fields: m.fields as [string, string][] };
+    case "HELLO":
+      return { type: "HELLO", rpcId, caps: m.caps as number };
+    case "DATA_SEQ":
+      return {
+        type: "DATA_SEQ", rpcId, totalSize: m.totalSize as number, offset: m.offset as number, seq: m.seq as number,
+        payload: fromHex(m.payload as string),
+      };
+    case "RESEND_SEQ":
+      return { type: "RESEND_SEQ", rpcId, start: m.start as number, end: m.end as number };
   }
   throw new Error(`unknown vector type ${m.type}`);
 }

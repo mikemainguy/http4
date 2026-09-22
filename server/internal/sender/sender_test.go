@@ -70,7 +70,11 @@ func (c *fakeConn) SendDatagram(b []byte) error {
 		c.t.Errorf("server sent undecodable datagram %x: %v", b, err)
 		return nil
 	}
-	if d, ok := p.(*wire.Data); ok {
+	d, ok := p.(*wire.Data)
+	if ds, isSeq := p.(*wire.DataSeq); isSeq {
+		d, ok = &ds.Data, true // DATA_SEQ is DATA as far as grants go
+	}
+	if ok {
 		c.mu.Lock()
 		if end := d.Offset + uint32(len(d.Payload)); end > c.ceiling[d.RPCID] {
 			c.violation = append(c.violation, "DATA past grant")
@@ -161,8 +165,11 @@ func asset(n int) []byte {
 func datas(ps []wire.Packet) []*wire.Data {
 	var ds []*wire.Data
 	for _, p := range ps {
-		if d, ok := p.(*wire.Data); ok {
-			ds = append(ds, d)
+		switch p := p.(type) {
+		case *wire.Data:
+			ds = append(ds, p)
+		case *wire.DataSeq:
+			ds = append(ds, &p.Data)
 		}
 	}
 	return ds

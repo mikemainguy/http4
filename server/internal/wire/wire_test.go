@@ -73,6 +73,13 @@ func packetFromJSON(t *testing.T, m map[string]any) Packet {
 			fields = append(fields, Field{Name: kv[0].(string), Value: kv[1].(string)})
 		}
 		return &Meta{RPCID: rpc, Fields: fields}
+	case "HELLO":
+		return &Hello{RPCID: rpc, Caps: u32("caps")}
+	case "DATA_SEQ":
+		d := Data{RPCID: rpc, TotalSize: u32("totalSize"), Offset: u32("offset"), Payload: mustHex(t, m["payload"].(string))}
+		return &DataSeq{Data: d, Seq: u32("seq")}
+	case "RESEND_SEQ":
+		return &ResendSeq{RPCID: rpc, Start: u32("start"), End: u32("end")}
 	}
 	t.Fatalf("unknown vector type %v", m["type"])
 	return nil
@@ -113,15 +120,17 @@ func TestVectorsInvalid(t *testing.T) {
 
 func TestEncodeRejectsWhatDecodeRejects(t *testing.T) {
 	for name, p := range map[string]Packet{
-		"empty asset id":   &Req{AssetID: ""},
-		"asset id > 65535": &Req{AssetID: string(make([]byte, 0x10000))},
-		"non-UTF-8 id":     &Req{AssetID: "\xff"},
-		"data past total":  &Data{TotalSize: 2, Offset: 1, Payload: []byte{1, 2}},
-		"empty resend":     &Resend{Start: 5, End: 5},
-		"meta bad name":    &Meta{Fields: []Field{{"server", "go"}}},
-		"meta duplicate":   &Meta{Fields: []Field{{"etag", `"a"`}, {"etag", `"b"`}}},
-		"meta empty value": &Meta{Fields: []Field{{"etag", ""}}},
-		"meta non-ASCII":   &Meta{Fields: []Field{{"content-type", "é"}}},
+		"empty asset id":      &Req{AssetID: ""},
+		"asset id > 65535":    &Req{AssetID: string(make([]byte, 0x10000))},
+		"non-UTF-8 id":        &Req{AssetID: "\xff"},
+		"data past total":     &Data{TotalSize: 2, Offset: 1, Payload: []byte{1, 2}},
+		"empty resend":        &Resend{Start: 5, End: 5},
+		"meta bad name":       &Meta{Fields: []Field{{"server", "go"}}},
+		"meta duplicate":      &Meta{Fields: []Field{{"etag", `"a"`}, {"etag", `"b"`}}},
+		"meta empty value":    &Meta{Fields: []Field{{"etag", ""}}},
+		"meta non-ASCII":      &Meta{Fields: []Field{{"content-type", "é"}}},
+		"data_seq past total": &DataSeq{Data: Data{TotalSize: 2, Offset: 1, Payload: []byte{1, 2}}, Seq: 7},
+		"empty resend_seq":    &ResendSeq{Start: 9, End: 9},
 	} {
 		if _, err := Marshal(p); !errors.Is(err, ErrMalformed) {
 			t.Errorf("%s: err = %v, want ErrMalformed", name, err)
