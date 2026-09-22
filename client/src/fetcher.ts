@@ -76,11 +76,24 @@ export function prefixMapper(baseUrl: string, prefix: string): (url: URL) => str
 
 /** Builds the Response for a completed HTTP4 transfer. */
 export function responseFor(r: Http4Response, head: boolean): Response {
-  const headers = new Headers();
-  for (const [name, value] of Object.entries(r.headers)) headers.set(name, value);
-  headers.set("content-length", String(r.body.length));
-  return new Response(head ? null : r.body, { status: 200, headers });
+  return new Response(head ? null : r.body, { status: 200, headers: headersFor(r) });
 }
+
+/** Response headers for an HTTP4 transfer: its META plus Content-Length. */
+export function headersFor(r: Http4Response): [string, string][] {
+  const headers: [string, string][] = Object.entries(r.headers);
+  headers.push(["content-length", String(r.body.length)]);
+  return headers;
+}
+
+/**
+ * What HTTP4 made of one request, without falling back: either a response
+ * (its body is the transfer's own buffer, so it can be transferred between
+ * threads) or the reason the platform fetch should serve it instead.
+ */
+export type Http4Outcome =
+  | { transport: "http4"; status: number; headers: [string, string][]; body: Uint8Array<ArrayBuffer> | null }
+  | { transport: "fallback" | "platform"; reason: string };
 
 export class Http4Fetcher {
   private readonly session: AssetRequester | null;
@@ -139,9 +152,21 @@ export class Http4Fetcher {
 
     const skip = this.ineligible(method, url, init, req);
     if (skip) return viaPlatform("platform", skip);
+    const o = await this.outcome(url, method, signal);
+    if (o.transport !== "http4") return viaPlatform(o.transport, o.reason);
+    record("http4", o.status, o.body?.length ?? 0);
+    return new Response(o.body, { status: o.status, headers: o.headers, ...(o.status === 404 ? { statusText: "Not Found" } : {}) });
+  }
+
+  /**
+   * Try one GET/HEAD over HTTP4 without falling back or recording it: the
+   * Service Worker bridge uses this and does its own fallback and reporting.
+   * The caller has already checked method, origin, body and Range.
+   */
+  async outcome(url: URL, method: string, signal?: AbortSignal): Promise<Http4Outcome> {
     const assetId = this.opts.pathToAssetId(url);
-    if (assetId === null) return viaPlatform("platform", "not an HTTP4 asset path");
-    if (!this.session?.isOpen) return viaPlatform("fallback", this.unavailableReason ?? "HTTP4 unavailable");
+    if (assetId === null) return { transport: "platform", reason: "not an HTTP4 asset path" };
+    if (!this.session?.isOpen) return { transport: "fallback", reason: this.unavailableReason ?? "HTTP4 unavailable" };
 
     signal?.throwIfAborted();
     let r: Http4Response;
@@ -151,13 +176,11 @@ export class Http4Fetcher {
       if (signal?.aborted && e === signal.reason) throw e;
       if (e instanceof Http4Error && e.code === ErrorCode.NOT_FOUND) {
         // The server answered authoritatively: don't ask again over HTTP.
-        record("http4", 404, 0);
-        return new Response(null, { status: 404, statusText: "Not Found" });
+        return { transport: "http4", status: 404, headers: [], body: null };
       }
-      return viaPlatform("fallback", `HTTP4 ${httpStatusFor(e)}: ${e instanceof Error ? e.message : String(e)}`);
+      return { transport: "fallback", reason: `HTTP4 ${httpStatusFor(e)}: ${e instanceof Error ? e.message : String(e)}` };
     }
-    record("http4", 200, r.body.length);
-    return responseFor(r, method === "HEAD");
+    return { transport: "http4", status: 200, headers: headersFor(r), body: method === "HEAD" ? null : r.body };
   }
 
   /** Why a request can't go over HTTP4 regardless of its path, or null. */

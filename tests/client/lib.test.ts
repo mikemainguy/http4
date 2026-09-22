@@ -205,7 +205,10 @@ test("connect() without WebTransport resolves to a fallback-only handle", async 
   assert.equal(h.client, undefined);
   const res = await h.fetch("/assets/app.js");
   assert.equal(await res.text(), "from-platform");
-  assert.equal(calls.length, 1, "no config fetch: WebTransport was missing before discovery");
+  // The config is still read (for its assetPrefix); here it isn't valid JSON,
+  // which is ignored because the missing API is the reason that matters.
+  assert.equal(calls.length, 2, "config fetch, then the asset");
+  assert.match(String(calls[0]!.input), /\/config\.json$/);
   assert.deepEqual(
     h.report().map((r) => [r.transport, r.reason]),
     [["fallback", "WebTransport not supported"]],

@@ -61,6 +61,40 @@ of:
   `initialGrant`, `rtoFloorMs`, `maxRecoveries`. `trace` and `dropOutgoing`
   are for tests only.
 
+## Drop-in: Service Worker
+
+For a site to load its own markup-referenced resources over HTTP4 (img, CSS,
+scripts, fonts, fetch) without code changes, serve two built files and add
+one tag, first in `<head>`:
+
+- `dist/http4-sw.js` at the site root, as `/http4-sw.js` (its scope must cover the site);
+- `dist/auto.js` as `/http4/auto.js`.
+
+```html
+<script src="/http4/auto.js"></script>
+```
+
+`auto.js` opens this tab's HTTP4 session, registers the worker, and exposes
+`window.http4`: `ready` (the tab's `Http4` handle), `registration`,
+`controlled`, and `report({ all? })` (how the worker served each request).
+`install(opts)` does the same programmatically; the tag also accepts
+`data-config-url` and `data-asset-prefix`.
+
+The worker holds no session. It forwards each same-origin GET/HEAD
+subresource to the tab that made it, and that tab's session answers, with the
+body transferred back, not copied. The session therefore lives as long as the
+tab, not the worker, which Chrome stops after ~30 s idle. The worker goes to
+the network for:
+
+- navigations;
+- the first visit, before it controls the page;
+- tabs without the bridge;
+- sessions that are down or not up within 2 s;
+- failed transfers.
+
+It never forwards `/http4/*`, `/http4-sw.js` or `/config.json`. Forwarding
+costs about 1 ms per small request on loopback.
+
 ## Limits
 
 - An aborted request stops waiting, but its HTTP4 transfer runs to completion,

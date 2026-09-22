@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "esbuild client/src/main.ts http4=client/src/index.ts --bundle --format=esm --target=chrome120 --sourcemap --outdir=client/dist && tsc -p client/tsconfig.types.json",
+    "build": "esbuild client/src/main.ts http4=client/src/index.ts --bundle --format=esm --target=chrome120 --sourcemap --outdir=client/dist && esbuild http4-sw=client/src/sw.ts auto=client/src/auto.ts --bundle --format=iife --target=chrome120 --sourcemap --outdir=client/dist && tsc -p client/tsconfig.types.json",
     "postbuild": "scripts/embed-client",
     "typecheck": "tsc -p client && tsc -p tests",
     "test:go": "cd server && go test ./...",

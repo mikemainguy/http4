@@ -15,6 +15,9 @@ export { Http4Client, Http4Error, httpStatusFor } from "./transport.ts";
 export type { ClientOptions, ClientStats, Http4Response } from "./transport.ts";
 export { prefixMapper } from "./fetcher.ts";
 export type { RequestReport, Transport } from "./fetcher.ts";
+export { install } from "./page.ts";
+export type { Http4Page, InstallOptions } from "./page.ts";
+export type { SwRequestReport } from "./swproto.ts";
 
 export const DEFAULT_ASSET_PREFIX = "/assets/";
 export const DEFAULT_CONFIG_URL = "/config.json";
@@ -36,7 +39,10 @@ export interface ConnectOptions extends ClientOptions {
   certHash?: Uint8Array<ArrayBuffer> | string;
   /** JSON with `webTransportUrl` and optional `certHash`, used when `webTransportUrl` is not given. Default "/config.json". */
   configUrl?: string;
-  /** Same-origin path prefix whose URLs map to HTTP4 asset IDs. Default "/assets/". */
+  /**
+   * Same-origin path prefix whose URLs map to HTTP4 asset IDs. Default: the
+   * config's `assetPrefix` if it has one (http4d serve uses "/"), else "/assets/".
+   */
   assetPrefix?: string;
   /** Custom URL → asset ID mapping (null = not HTTP4). Overrides `assetPrefix`. */
   pathToAssetId?: (url: URL) => string | null;
@@ -70,6 +76,19 @@ export interface Http4 {
 
 /** Open an HTTP4 session. Resolves even when HTTP4 is unavailable (fallback-only). */
 export async function connect(opts: ConnectOptions = {}): Promise<Http4> {
+  return (await open(opts)).handle;
+}
+
+/** What connect() builds, plus the internals the Service Worker bridge needs. */
+export interface Opened {
+  handle: Http4;
+  fetcher: Http4Fetcher;
+  /** The prefix in effect, or undefined when a custom pathToAssetId is used. */
+  assetPrefix: string | undefined;
+}
+
+/** connect(), also returning the fetcher. Internal: the Service Worker bridge uses it. */
+export async function open(opts: ConnectOptions = {}): Promise<Opened> {
   const {
     webTransportUrl, certHash, configUrl, assetPrefix, pathToAssetId, baseUrl: base, onRequest, reportLimit,
     connectTimeoutMs, fetch: fetchOpt, ...clientOpts
@@ -80,23 +99,25 @@ export async function connect(opts: ConnectOptions = {}): Promise<Http4> {
 
   let client: Http4Client | undefined;
   let reason: string | undefined;
+  const cfg: ServerConfig = {};
   try {
     client = await openSession(
       webTransportUrl, certHash, new URL(configUrl ?? DEFAULT_CONFIG_URL, baseUrl).href,
-      platformFetch, clientOpts, connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
+      platformFetch, clientOpts, connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS, cfg,
     );
   } catch (e) {
     reason = e instanceof Error ? e.message : String(e);
   }
 
+  const prefix = pathToAssetId ? undefined : (assetPrefix ?? cfg.assetPrefix ?? DEFAULT_ASSET_PREFIX);
   const fetcher = new Http4Fetcher(client ?? null, reason, {
     baseUrl,
-    pathToAssetId: pathToAssetId ?? prefixMapper(baseUrl, assetPrefix ?? DEFAULT_ASSET_PREFIX),
+    pathToAssetId: pathToAssetId ?? prefixMapper(baseUrl, prefix!),
     platformFetch,
     ...(onRequest ? { onRequest } : {}),
     ...(reportLimit !== undefined ? { reportLimit } : {}),
   });
-  return {
+  const handle: Http4 = {
     fetch: (input, init) => fetcher.fetch(input, init),
     report: () => fetcher.report(),
     get available() {
@@ -108,6 +129,14 @@ export async function connect(opts: ConnectOptions = {}): Promise<Http4> {
     client,
     close: () => client?.close(),
   };
+  return { handle, fetcher, assetPrefix: prefix };
+}
+
+/** The parts of /config.json the client reads. */
+interface ServerConfig {
+  webTransportUrl?: string;
+  certHash?: string;
+  assetPrefix?: string;
 }
 
 async function openSession(
@@ -117,16 +146,26 @@ async function openSession(
   platformFetch: typeof fetch,
   clientOpts: ClientOptions,
   timeoutMs: number,
+  cfgOut: ServerConfig,
 ): Promise<Http4Client> {
-  if (typeof WebTransport === "undefined") throw new Error("WebTransport not supported");
+  const noWebTransport = typeof WebTransport === "undefined";
   if (url === undefined) {
-    const res = await platformFetch(configUrl, { cache: "no-store" });
-    if (!res.ok) throw new Error(`config ${configUrl}: HTTP ${res.status}`);
-    const cfg = (await res.json()) as { webTransportUrl?: string; certHash?: string };
-    if (!cfg.webTransportUrl) throw new Error(`config ${configUrl}: no webTransportUrl`);
-    url = cfg.webTransportUrl;
-    hash ??= cfg.certHash;
+    // Read the config even without WebTransport, because its assetPrefix
+    // decides which requests count as HTTP4-eligible fallbacks. Then a
+    // config problem is secondary: the reason reported is the missing API.
+    try {
+      const res = await platformFetch(configUrl, { cache: "no-store" });
+      if (!res.ok) throw new Error(`config ${configUrl}: HTTP ${res.status}`);
+      Object.assign(cfgOut, (await res.json()) as ServerConfig);
+    } catch (e) {
+      if (!noWebTransport) throw e;
+    }
+    if (noWebTransport) throw new Error("WebTransport not supported");
+    if (!cfgOut.webTransportUrl) throw new Error(`config ${configUrl}: no webTransportUrl`);
+    url = cfgOut.webTransportUrl;
+    hash ??= cfgOut.certHash;
   }
+  if (noWebTransport) throw new Error("WebTransport not supported");
   const bytes = typeof hash === "string" ? Uint8Array.from(atob(hash), (c) => c.charCodeAt(0)) : hash;
   const pending = Http4Client.connect(url, bytes, clientOpts);
   let timer: ReturnType<typeof setTimeout> | undefined;
