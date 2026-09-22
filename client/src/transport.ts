@@ -12,12 +12,21 @@
 // missing range below the grant. The timeout doubles on each attempt without
 // progress, and the transfer fails after `maxRecoveries` attempts.
 //
+// Most loss is repaired well before that timer (vrek iss-e58kfkh). Like TCP's
+// fast retransmit, a gap that later data has skipped by more than a few
+// packets is a loss suspect; once it has stayed missing for a reordering
+// window (RACK-style: a quarter of the min RTT, widened whenever a repair
+// turns out to have been spurious) it is RESENT straight away. A RESENT range
+// isn't requested again until the round trip plus the queue ahead of it has
+// had time to deliver it (RepairTracker), and the budget backs off at most
+// once per round trip however many gaps are found.
+//
 // The grant budget and each REQ's initial grant follow the measured
 // bandwidth-delay product (budget.ts), so throughput isn't capped at a fixed
 // budget ÷ RTT on long paths.
 
 import { BudgetController } from "./budget.ts";
-import { Reassembly } from "./reassembly.ts";
+import { Reassembly, RepairTracker } from "./reassembly.ts";
 import { SrptScheduler, type GrantTrace } from "./scheduler.ts";
 import { decode, encode, maxPayload, newRpcId, ErrorCode, MalformedPacketError, type Packet } from "./wire.ts";
 
@@ -46,6 +55,13 @@ export interface ClientOptions {
   rtoFloorMs?: number;
   /** Recovery attempts without progress before a transfer fails. */
   maxRecoveries?: number;
+  /**
+   * RESEND a gap as soon as later data shows it's lost, instead of waiting
+   * for the stall timer (default true). Off only to measure the difference.
+   */
+  earlyResend?: boolean;
+  /** How many packets past a gap the frontier must be before it's a loss suspect (default 3). */
+  reorderPackets?: number;
   /** Record every grant decision (for tests). */
   trace?: GrantTrace[];
   /** TESTING ONLY: return true to drop an outgoing packet, simulating loss. */
@@ -60,7 +76,11 @@ export interface ClientStats {
   grantsSent: number;
   reqsSent: number;
   reqRetransmits: number;
-  resendsSent: number;
+  resendsSent: number; // every RESEND packet, early or from the stall timer
+  earlyResends: number; // RESENDs sent because later data showed a gap
+  tailProbes: number; // RESENDs of a stalled tail's last packet, ahead of the stall timer
+  spuriousRepairs: number; // times a repaired range arrived twice (the original was only late)
+  reorderWindowMs: number; // how long a skipped-over gap may stay missing before it counts as lost
   metaIn: number;
   recoveries: number;
   droppedOutgoing: number;
@@ -115,6 +135,9 @@ interface Transfer {
   assetId: string;
   initialGrant: number;
   asm?: Reassembly; // set once the first DATA reveals the size
+  repair?: RepairTracker; // set with asm
+  lastDetect: number; // when early loss detection last ran for it
+  tailProbed: boolean; // a tail loss probe went out since the last progress
   headers?: Record<string, string>; // set by the first META
   replied: boolean; // anything has arrived for it (RTT sample taken)
   resolve(r: Http4Response): void;
@@ -152,6 +175,18 @@ const MAX_INITIAL_RTO_MS = 1000;
 const DEFAULT_MAX_RECOVERIES = 10;
 const MAX_RTO_MS = 2000;
 const MAX_RESEND_RANGES = 16; // per recovery attempt
+const DEFAULT_REORDER_PACKETS = 3; // TCP's duplicate-ACK threshold
+const DEFAULT_PAYLOAD = 1183; // server DATA payload at a 1200-byte datagram, until one is seen
+// The reordering window is a quarter of the min RTT (RACK), at least this
+// long, and grows ×2 per spurious repair up to MAX_REORDER_STEPS quarters.
+const MIN_REORDER_WINDOW_MS = 1;
+const MAX_REORDER_STEPS = 16;
+const DETECT_INTERVAL_MS = 1; // early detection runs at most this often per transfer on arrivals
+const MIN_REPAIR_DELAY_MS = 2;
+// quic-go queues at most this many datagrams before SendDatagram blocks
+// (maxDatagramSendQueueLen), so a repair waits behind no more than that.
+const SERVER_SEND_QUEUE_PACKETS = 32;
+const MAX_DRAIN_MS = 10_000; // a stall timeout never waits longer than this for queued bytes
 
 export class Http4Client {
   readonly maxDatagramSize: number;
@@ -166,6 +201,12 @@ export class Http4Client {
   private readonly rtoFloor: number;
   private readonly maxRecoveries: number;
   private readonly dropOutgoing: ((p: Packet) => boolean) | undefined;
+  private readonly earlyResend: boolean;
+  private readonly reorderPackets: number;
+  private payloadSeen = 0; // largest DATA payload so far: the server's packet size
+  private reorderSteps = 1;
+  private lastSpuriousAt = -Infinity;
+  private lastLossBackoffAt = -Infinity;
   private srtt: number | null = null;
   private rttvar = 0;
   private initialRto = INITIAL_RTO_MS;
@@ -194,11 +235,15 @@ export class Http4Client {
     this.rtoFloor = opts.rtoFloorMs ?? DEFAULT_RTO_FLOOR_MS;
     this.maxRecoveries = opts.maxRecoveries ?? DEFAULT_MAX_RECOVERIES;
     this.dropOutgoing = opts.dropOutgoing;
+    this.earlyResend = opts.earlyResend ?? true;
+    this.reorderPackets = opts.reorderPackets ?? DEFAULT_REORDER_PACKETS;
     this.stats = {
       packetsIn: 0, malformedIn: 0, dataBytesIn: 0, duplicateBytesIn: 0, grantsSent: 0, reqsSent: 0,
-      reqRetransmits: 0, resendsSent: 0, metaIn: 0, recoveries: 0, droppedOutgoing: 0, srttMs: null, rtoMs: this.rto(),
+      reqRetransmits: 0, resendsSent: 0, earlyResends: 0, tailProbes: 0, spuriousRepairs: 0, reorderWindowMs: 0,
+      metaIn: 0, recoveries: 0, droppedOutgoing: 0, srttMs: null, rtoMs: this.rto(),
       budget: this.budget.budget, bdpBytes: 0, minRttMs: null,
     };
+    this.stats.reorderWindowMs = this.reorderWindow();
     void this.readLoop();
     void wt.closed.finally(() => {
       this.sessionClosed = true;
@@ -235,7 +280,7 @@ export class Http4Client {
     return new Promise((resolve, reject) => {
       const now = performance.now();
       this.transfers.set(rpcId, {
-        rpcId, assetId, initialGrant, replied: false, resolve, reject,
+        rpcId, assetId, initialGrant, replied: false, resolve, reject, lastDetect: -Infinity, tailProbed: false,
         reqSentAt: now, reqRetransmitted: false, baseRto: this.rto(), ceiling: initialGrant, lastProgress: now, recoveries: 0,
       });
       this.startTicker();
@@ -330,6 +375,7 @@ export class Http4Client {
       case "DATA": {
         if (!t.asm) {
           t.asm = new Reassembly(p.totalSize);
+          t.repair = new RepairTracker();
           this.scheduler.add(t.rpcId, p.totalSize, t.initialGrant, 0);
         } else if (p.totalSize !== t.asm.size) {
           return this.finish(t, new Http4Error(`total_size changed from ${t.asm.size} to ${p.totalSize}`));
@@ -342,6 +388,8 @@ export class Http4Client {
         }
         this.stats.dataBytesIn += p.payload.length;
         this.stats.duplicateBytesIn += p.payload.length - fresh;
+        this.payloadSeen = Math.max(this.payloadSeen, p.payload.length);
+        if (fresh < p.payload.length && t.repair!.requested) this.noteSpurious(performance.now());
         this.scheduler.onData(t.rpcId, fresh);
         if (t.probe && p.offset + p.payload.length > t.probe.from) {
           const now = performance.now();
@@ -353,8 +401,11 @@ export class Http4Client {
           this.budget.onDelivered(fresh, performance.now());
           t.lastProgress = performance.now();
           t.recoveries = 0;
+          t.tailProbed = false;
         }
-        if (t.asm.complete && t.headers) this.finish(t);
+        if (t.asm.complete && t.headers) return this.finish(t);
+        const now = performance.now();
+        if (now - t.lastDetect >= DETECT_INTERVAL_MS) this.detectLoss(t, now);
         return;
       }
       case "ERROR": {
@@ -421,6 +472,9 @@ export class Http4Client {
   private tick(): void {
     const now = performance.now();
     for (const t of [...this.transfers.values()]) {
+      // A suspect gap's reordering window can end without another packet
+      // arriving for its transfer, so the tick runs detection too.
+      if (t.asm) this.detectLoss(t, now);
       const granted = t.asm ? (this.scheduler.granted(t.rpcId) ?? 0) : 0;
       const waiting = t.asm !== undefined && t.headers !== undefined && t.asm.received >= granted;
       if (waiting) {
@@ -428,10 +482,29 @@ export class Http4Client {
         t.lastProgress = now;
         continue;
       }
+      // Tail loss probe (RACK-TLP): if the tail stops arriving for about two
+      // round trips plus the queue ahead, re-request its last packet once,
+      // well before the stall timer. If that packet was lost too, its repair
+      // moves the frontier to the end and early detection finds the rest.
+      if (this.earlyResend && t.asm && t.repair && !t.tailProbed && this.srtt !== null) {
+        const pto = Math.max(MIN_REPAIR_DELAY_MS, 2 * this.srtt) + this.drainMs();
+        if (t.asm.frontier < granted && now - t.lastProgress >= pto) {
+          t.tailProbed = true;
+          const p = this.payloadSeen || DEFAULT_PAYLOAD;
+          const last = { start: Math.max(t.asm.frontier, granted - p), end: granted };
+          for (const gap of t.repair.claim(t.asm, [last], now, this.repairDelay())) {
+            this.stats.resendsSent++;
+            this.stats.tailProbes++;
+            this.send({ type: "RESEND", rpcId: t.rpcId, start: gap.start, end: gap.end });
+          }
+        }
+      }
       // Before an RTT sample, a transfer backs off from the RTO it started
       // with, so the initial-RTO backoff (below) only slows later REQs.
       const base = this.srtt === null ? Math.min(t.baseRto, this.rto()) : this.rto();
-      const timeout = Math.min(MAX_RTO_MS, base * 2 ** t.recoveries);
+      // A big budget can hold more in flight than one RTO drains, so bytes
+      // merely queued ahead aren't a stall until they've had time to arrive.
+      const timeout = Math.max(Math.min(MAX_RTO_MS, base * 2 ** t.recoveries), this.drainMs());
       if (now - t.lastProgress >= timeout) this.recover(t, granted, now);
     }
     if (this.transfers.size === 0) {
@@ -446,7 +519,7 @@ export class Http4Client {
       return this.finish(t, new Http4Error(`${t.assetId}: no progress after ${this.maxRecoveries} recovery attempts (${got})`));
     }
     this.stats.recoveries++;
-    this.budget.onLoss(now);
+    this.lossBackoff(now);
     // A timeout before any RTT sample means the initial RTO may be shorter
     // than the path's RTT: back it off for later transfers too. Many
     // transfers timing out together count once.
@@ -467,10 +540,111 @@ export class Http4Client {
     }
     // The server may never have seen our latest GRANT; grants are idempotent.
     if (granted > t.initialGrant) this.send({ type: "GRANT", rpcId: t.rpcId, maxOffset: granted, priority: 0 });
-    for (const gap of t.asm.missing(granted).slice(0, MAX_RESEND_RANGES)) {
+    // Real gaps (missing below data that has arrived) are RESENT whole. The
+    // tail past the frontier may simply still be in flight, so rather than
+    // re-requesting all of it, probe its first and last packet (RACK-TLP's
+    // tail loss probe): if the last one was lost too, its repair moves the
+    // frontier to the end and early detection finds the rest.
+    const frontier = t.asm.frontier;
+    const gaps = t.asm.missing(Math.min(frontier, granted)).slice(0, MAX_RESEND_RANGES);
+    if (frontier < granted) {
+      const p = this.payloadSeen || DEFAULT_PAYLOAD;
+      const first = { start: frontier, end: Math.min(granted, frontier + p) };
+      const last = { start: Math.max(first.end, granted - p), end: granted };
+      gaps.push(first);
+      if (last.start < last.end) gaps.push(last);
+    }
+    for (const gap of t.repair!.claim(t.asm, gaps, now, this.repairDelay())) {
       this.stats.resendsSent++;
       this.send({ type: "RESEND", rpcId: t.rpcId, start: gap.start, end: gap.end });
     }
+  }
+
+  /**
+   * Early loss detection for one transfer: RESEND the gaps that data past
+   * them (by more than `reorderPackets` packets) shows are lost, once they've
+   * stayed missing for the reordering window.
+   */
+  private detectLoss(t: Transfer, now: number): void {
+    t.lastDetect = now;
+    if (!this.earlyResend || !t.asm || !t.repair) return;
+    // While more data is still expected past the frontier, a gap must be
+    // skipped by a few packets before it's a suspect. Once the frontier has
+    // reached the grant nothing later will arrive to show it, so only the
+    // reordering window applies.
+    const frontier = t.asm.frontier;
+    const granted = this.scheduler.granted(t.rpcId) ?? t.asm.size;
+    const limit = frontier < granted ? frontier - this.reorderPackets * (this.payloadSeen || DEFAULT_PAYLOAD) : frontier;
+    if (limit <= 0) return;
+    const lost = t.repair.detect(t.asm, limit, now, this.reorderWindow(), this.repairDelay());
+    // No budget backoff here: an isolated loss is already handled by QUIC's
+    // congestion control, and the delivery-rate estimate the budget follows
+    // falls on its own if the path slows. Shrinking per loss as well pinned
+    // the budget at its floor under steady random loss. Only a real stall
+    // (the timer path) backs off.
+    for (const gap of lost) {
+      this.stats.resendsSent++;
+      this.stats.earlyResends++;
+      this.send({ type: "RESEND", rpcId: t.rpcId, start: gap.start, end: gap.end });
+    }
+  }
+
+  /**
+   * RACK's reordering window: a quarter of the min RTT, at least 1 ms, times
+   * a step count that doubles on each spurious repair, never beyond one srtt.
+   */
+  private reorderWindow(): number {
+    const rtt = this.budget.minRttMs ?? this.srtt;
+    const quarter = Math.max(MIN_REORDER_WINDOW_MS, (rtt ?? 0) / 4);
+    return Math.min(quarter * this.reorderSteps, Math.max(quarter, this.srtt ?? quarter));
+  }
+
+  /**
+   * How long a RESENT range gets before it may be requested again: 1.5 round
+   * trips plus the time to drain the server's datagram send queue at the
+   * measured delivery rate. The server sends repairs ahead of new data, so
+   * only what's already queued there is ahead of one, not the whole budget.
+   * Without a rate yet, the RTO.
+   */
+  private repairDelay(): number {
+    const rtt = this.srtt ?? this.budget.minRttMs ?? this.rto();
+    const rate = this.budget.maxRate; // bytes per ms
+    const queued = SERVER_SEND_QUEUE_PACKETS * (this.payloadSeen || DEFAULT_PAYLOAD);
+    const drain = rate > 0 ? queued / rate : this.rto();
+    return Math.min(MAX_RTO_MS, Math.max(MIN_REPAIR_DELAY_MS, 1.5 * rtt + drain));
+  }
+
+  /**
+   * How long everything granted but not yet received needs to arrive at the
+   * measured delivery rate (0 before there's a rate), capped so a genuine
+   * stall is still noticed.
+   */
+  private drainMs(): number {
+    const rate = this.budget.maxRate;
+    return rate > 0 ? Math.min(MAX_DRAIN_MS, this.scheduler.outstanding() / rate) : 0;
+  }
+
+  /**
+   * A repaired range arrived twice: the original was only late. Widen the
+   * reordering window, at most once per round trip.
+   */
+  private noteSpurious(now: number): void {
+    this.stats.spuriousRepairs++;
+    if (now - this.lastSpuriousAt < (this.srtt ?? MIN_REORDER_WINDOW_MS)) return;
+    this.lastSpuriousAt = now;
+    this.reorderSteps = Math.min(MAX_REORDER_STEPS, this.reorderSteps * 2);
+    this.stats.reorderWindowMs = this.reorderWindow();
+  }
+
+  /**
+   * Shrink the budget for a loss, but only once per round trip, as TCP
+   * reduces once per window: a burst of gaps found together is one event.
+   */
+  private lossBackoff(now: number): void {
+    if (now - this.lastLossBackoffAt < Math.max(MIN_REORDER_WINDOW_MS, this.srtt ?? this.budget.minRttMs ?? 0)) return;
+    this.lastLossBackoffAt = now;
+    this.budget.onLoss(now);
+    this.stats.reorderWindowMs = this.reorderWindow();
   }
 
   private finish(t: Transfer, err?: Error): void {
