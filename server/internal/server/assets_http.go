@@ -37,7 +37,7 @@ func (s *Server) handleAsset(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	a, err := s.assets.Get(id)
+	a, err := s.pool.Get(id)
 	if errors.Is(err, sender.ErrNotFound) {
 		http.NotFound(w, r)
 		return
@@ -46,6 +46,12 @@ func (s *Server) handleAsset(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "asset unavailable", http.StatusInternalServerError)
 		return
 	}
+	writeAsset(w, r, a)
+}
+
+// writeAsset sends an asset over HTTP with the same Content-Type, ETag and
+// Cache-Control that META carries for it over HTTP4.
+func writeAsset(w http.ResponseWriter, r *http.Request, a *sender.Asset) {
 	h := w.Header()
 	h.Set("Content-Type", a.ContentType)
 	h.Set("ETag", a.ETag)

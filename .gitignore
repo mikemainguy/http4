@@ -10,6 +10,10 @@ node_modules/
 client/dist/
 client/bench/dist/
 
+# client bundle copied in for go:embed by scripts/embed-client; the placeholder is committed
+server/internal/clientdist/dist/*
+!server/internal/clientdist/dist/.gitkeep
+
 # JetBrains IDE project files
 .idea/
 

@@ -94,7 +94,7 @@ func TestAssetHandlerRefusesEscape(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { assets.Close() })
-	s := &Server{assets: assets}
+	s := &Server{assets: assets, pool: assets}
 	for _, id := range []string{"../index.html", "../../etc/passwd", "/etc/passwd"} {
 		w := httptest.NewRecorder()
 		r := httptest.NewRequest(http.MethodGet, "/", nil)
