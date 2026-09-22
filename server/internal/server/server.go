@@ -4,6 +4,7 @@
 package server
 
 import (
+	"cmp"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -38,6 +39,10 @@ type Config struct {
 	StaticDir string // directory served at / (the built client)
 	AssetsDir string // directory HTTP4 REQs are served from
 	DropSpec  string // loss injection for outgoing DATA (sender.ParseDropSpec); testing only
+	// AdvertiseWT, if set, is the host:port put in the advertised WebTransport
+	// and echo URLs instead of the UDP listener's own address, e.g. an
+	// impairment proxy in front of it. The listener itself is unchanged.
+	AdvertiseWT string
 }
 
 // ClientConfig is served at /config.json so the page never hard-codes the
@@ -50,7 +55,8 @@ type ClientConfig struct {
 
 type Server struct {
 	HTTPURL         string
-	WebTransportURL string
+	WebTransportURL string // as advertised to clients
+	WTListenAddr    string // where the UDP listener actually is
 
 	cert     *devcert.Cert
 	assets   *sender.DirAssets
@@ -92,7 +98,8 @@ func Start(cfg Config) (*Server, error) {
 
 	s := &Server{
 		HTTPURL:         "http://" + httpLn.Addr().String(),
-		WebTransportURL: "https://" + udpConn.LocalAddr().String() + WebTransportPath,
+		WebTransportURL: "https://" + cmp.Or(cfg.AdvertiseWT, udpConn.LocalAddr().String()) + WebTransportPath,
+		WTListenAddr:    udpConn.LocalAddr().String(),
 		cert:            cert,
 		assets:          assets,
 		metrics:         new(sender.Metrics),
