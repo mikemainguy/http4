@@ -4,34 +4,20 @@
 // right SHA-256, on clean loopback and through the impairment proxy at
 // 50 ms RTT. It also reports, without asserting, how long the same
 // concurrent batch takes over h3 and over HTTP4.
-import path from "node:path";
 import { after, before, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { buildSync } from "esbuild";
 import type { Page } from "playwright-core";
-import { root, startHarness, type Harness } from "../support/harness.ts";
+import { startHarness, type Harness } from "../support/harness.ts";
 import { makeAssets, PAGE_ASSETS, type AssetSet } from "../support/assets.ts";
+import { buildBench, openBench } from "../support/bench.ts";
 import type { RequestResult, ScheduledRequest } from "../../client/bench/bench.ts";
 
 let assets: AssetSet;
 before(() => {
-  buildSync({
-    entryPoints: [path.join(root, "client/bench/bench.ts")],
-    bundle: true,
-    format: "esm",
-    target: "chrome120",
-    outdir: path.join(root, "client/bench/dist"),
-    logLevel: "warning",
-  });
+  buildBench();
   assets = makeAssets(PAGE_ASSETS);
 });
 after(() => assets?.remove());
-
-async function openBench(page: Page, http: string): Promise<void> {
-  await page.goto(http + "/bench/index.html");
-  await page.waitForFunction(() => window.__bench !== undefined, undefined, { timeout: 15_000 });
-  await page.evaluate(() => window.__bench!.ready);
-}
 
 function run(page: Page, schedule: ScheduledRequest[]): Promise<RequestResult[]> {
   return page.evaluate((s) => window.__bench!.run(s), schedule);

@@ -14,7 +14,8 @@
     "fixtures": "scripts/gen-fixtures",
     "integrity": "npm run build && node tests/integrity/run.ts",
     "matrix": "npm run build && node tests/matrix/run.ts",
-    "demo": "scripts/demo"
+    "demo": "scripts/demo",
+    "bench:g3": "npm run build && node tests/bench/g3.ts"
   },
   "devDependencies": {
     "@types/node": "^26.6.2",
