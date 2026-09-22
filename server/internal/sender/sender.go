@@ -5,9 +5,11 @@
 // updates state; it never sends, so a slow send can't delay it. The send
 // loop picks the next packet and hands it to QUIC. QUIC's SendDatagram blocks
 // while its queue is full, which paces the send loop at the congestion
-// controller's rate — but that queue is 32 datagrams deep and FIFO, so the
-// loop also holds off while it is deeper than SendQueueTarget, or a packet
-// picked now would leave behind bulk queued earlier (see pacer.go).
+// controller's rate — but that queue is 32 datagrams deep and FIFO, so a small
+// reply picked now can still depart behind bulk queued earlier. With
+// SendQueueTarget set, the loop holds bulk back to keep that queue shallow,
+// which trades throughput for that reply's latency and is off by default
+// (see pacer.go).
 package sender
 
 import (
