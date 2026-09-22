@@ -76,6 +76,19 @@ func run(cfg server.Config) {
 		log.Printf("open %s", srv.HTTPURL)
 	}
 
+	// SIGHUP re-reads a -cert file:... pair, so a renewal needs no restart.
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	go func() {
+		for range hup {
+			if err := srv.ReloadCert(); err != nil {
+				log.Printf("reload certificate: %v", err)
+			} else {
+				log.Print("reloaded certificate")
+			}
+		}
+	}()
+
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	done := make(chan error, 1)

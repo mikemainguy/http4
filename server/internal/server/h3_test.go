@@ -139,7 +139,7 @@ func TestH3PathSafetyAndMethods(t *testing.T) {
 func TestSPKIHashMatchesCertificate(t *testing.T) {
 	s := startTestServer(t, nil)
 	cfg := fetchConfig(t, s)
-	want := base64.StdEncoding.EncodeToString(s.cert.SPKIHash[:])
+	want := s.cert.SPKIHash()
 	if cfg.SPKIHash != want || cfg.SPKIHash == cfg.CertHash {
 		t.Fatalf("spkiHash %q, want %q (and distinct from certHash)", cfg.SPKIHash, want)
 	}
