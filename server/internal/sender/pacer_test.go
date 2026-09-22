@@ -53,18 +53,26 @@ func TestPacerMeasuresTheWireAndDrainsAFullQueue(t *testing.T) {
 	if got := p.interval; got < 3800*time.Microsecond || got > 4200*time.Microsecond {
 		t.Errorf("measured interval %v, want ≈ %v", got, interval)
 	}
-	// The last send blocked, so the queue is full: it holds off, one capped
-	// wait at a time, until enough datagrams have departed.
-	drain := time.Duration((quicSendQueue - 4 + 1) * interval) // 29 × 4 ms
+	// The last send blocked, so the queue is full: it stands back for the
+	// departures that bring it to the target, one capped wait at a time.
+	drain := time.Duration((quicSendQueue - 4) * interval) // 28 × 4 ms
 	if d := p.wait(at); d != pacerMaxWait {
 		t.Errorf("wait = %v after a full queue, want the %v cap", d, pacerMaxWait)
 	}
 	if d := p.wait(at.Add(pacerMaxWait)); d <= 0 {
 		t.Errorf("wait = %v partway through the drain, want it to keep holding off", d)
 	}
-	// Once those departures have happened, it stops holding off.
+	// Once those departures have happened, it paces instead of braking.
 	if d := p.wait(at.Add(drain)); d != 0 {
 		t.Errorf("wait = %v after the queue drained, want 0", d)
+	}
+	// One slot per departure from then on, a touch slower than the wire so the
+	// queue keeps draining, and no second brake: only an observed block means
+	// the queue is full.
+	slot := interval + interval/pacerHeadroom
+	p.sent(at.Add(drain), false)
+	if d := p.wait(at.Add(drain)); d < slot*3/4 || d > slot {
+		t.Errorf("wait = %v after the next send, want one slot (%v)", d, slot)
 	}
 }
 
@@ -87,19 +95,20 @@ func TestPacerMeasuresTheSustainedRateNotTheBurst(t *testing.T) {
 	}
 }
 
-func TestPacerProbesFasterWhileNothingBlocks(t *testing.T) {
+// The estimate must not drift on its own. A sender pacing a shallow queue
+// waits for every slot and blocks on none of them, which looks exactly like a
+// sender that is too slow, so anything that speeds up the estimate in that
+// state ratchets the queue back to full.
+func TestPacerHoldsItsEstimateWhileNothingBlocks(t *testing.T) {
 	p := &pacer{target: 4}
 	at := saturate(p, epoch, 4*time.Millisecond, 64)
 	measured := p.interval
-	for range 20 { // 20 × 200 ms of sends that find room
-		at = at.Add(pacerProbeEvery)
+	for range 2000 { // sends that wait for their slot and always find room
+		at = at.Add(p.wait(at))
 		p.sent(at, false)
 	}
-	if p.interval >= measured {
-		t.Errorf("interval %v did not creep below the measured %v", p.interval, measured)
-	}
-	if p.interval < measured*3/4 {
-		t.Errorf("interval %v crept too far below %v", p.interval, measured)
+	if p.interval != measured {
+		t.Errorf("interval drifted to %v from the measured %v with nothing to justify it", p.interval, measured)
 	}
 }
 
@@ -172,16 +181,17 @@ func TestPacerKeepsTheQueueShallowWithoutLosingThroughput(t *testing.T) {
 		}
 	}
 
-	// Throughput: the wire could carry run/interval datagrams; pacing must not
-	// give much of that up.
+	// Throughput: the wire could carry run/interval datagrams, of which pacing
+	// deliberately leaves pacerHeadroom unused so the queue drains. Giving up
+	// more than that is a bug, not the trade.
 	capacity := int(run / interval)
-	if sends < capacity*9/10 {
-		t.Errorf("sent %d datagrams, want ≥ 90%% of the wire's %d", sends, capacity)
+	if want := capacity - capacity/pacerHeadroom - capacity/50; sends < want {
+		t.Errorf("sent %d datagrams, want ≥ %d of the wire's %d", sends, want, capacity)
 	}
 	// Depth: the point of the exercise. Averaged, and however often it is
 	// allowed to run deep while the estimate re-syncs.
-	if avg := float64(depth) / float64(sends); avg > float64(p.target)+3 {
-		t.Errorf("average queue depth %.1f, want ≲ %d", avg, p.target+3)
+	if avg := float64(depth) / float64(sends); avg > float64(p.target) {
+		t.Errorf("average queue depth %.1f, want ≲ %d", avg, p.target)
 	}
 	if got := 100 * deep / sends; got > 20 {
 		t.Errorf("queue was deeper than target+2 for %d%% of sends, want ≤ 20%%", got)
@@ -264,8 +274,8 @@ func bulkAhead(t *testing.T, target int, interval time.Duration) int {
 // are what the pacer exists to protect, and making them wait throttles the
 // sender below its own offered load for no benefit at all.
 func TestSmallRepliesAreNeverHeldBack(t *testing.T) {
-	const interval = 2 * time.Millisecond
-	const n = 150
+	const interval = 5 * time.Millisecond
+	const n = 60
 
 	elapsed := func(target int) time.Duration {
 		assets := MapAssets{}
@@ -303,7 +313,7 @@ func TestSmallRepliesAreNeverHeldBack(t *testing.T) {
 // bulk saturates the wire must not depart behind a queue full of bulk
 // (vrek iss-dy53a59, fnd-pp7zab7).
 func TestSmallReplyDoesNotDepartBehindAFullQueueOfBulk(t *testing.T) {
-	const interval = 2 * time.Millisecond // 32 queued datagrams = 64 ms of wire
+	const interval = 5 * time.Millisecond // 32 queued datagrams = 160 ms of wire
 
 	unpaced := bulkAhead(t, -1, interval)
 	paced := bulkAhead(t, DefaultSendQueueTarget, interval)
@@ -312,7 +322,8 @@ func TestSmallReplyDoesNotDepartBehindAFullQueueOfBulk(t *testing.T) {
 	if unpaced < quicSendQueue*2/3 {
 		t.Errorf("unpaced, only %d bulk datagrams preceded the small reply; expected a nearly full queue (%d)", unpaced, quicSendQueue)
 	}
-	if want := DefaultSendQueueTarget + 4; paced > want {
+	// The target, plus whatever slack the timer's error leaves in the credit.
+	if want := DefaultSendQueueTarget * 3; paced > want {
 		t.Errorf("paced, %d bulk datagrams preceded the small reply, want ≤ %d", paced, want)
 	}
 }

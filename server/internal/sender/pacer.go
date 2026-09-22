@@ -7,36 +7,48 @@ import "time"
 const quicSendQueue = 32
 
 const (
-	// DefaultSendQueueTarget is how many datagrams the sender is willing to
-	// leave sitting in that queue ahead of the one it picks next.
+	// DefaultSendQueueTarget is how many datagrams may go out back to back
+	// after a pause, and so about how many the sender leaves sitting in QUIC's
+	// send queue ahead of the packet it picks next.
 	DefaultSendQueueTarget = 4
 	// pacerMinInterval is the departure interval below which pacing is not
 	// worth it: a full queue then drains in under ~8 ms, less than the timer
 	// granularity pacing would spend on it.
 	pacerMinInterval = 250 * time.Microsecond
 	// pacerBlocked is how slow a SendDatagram has to be to mean "the queue was
-	// full". An enqueue that finds room takes microseconds.
-	pacerBlocked = 250 * time.Microsecond
+	// full". An enqueue that finds room takes microseconds, but a send that
+	// happens to be slow — a timer wake, a lock, the scheduler — takes hundreds,
+	// and reading those as a full queue is expensive: each one brakes for a
+	// drain that is not needed and drags the rate estimate slower. A real wait
+	// for a departure lasts about one interval, and pacing only ever engages
+	// above pacerMinInterval, so the threshold sits well above the noise.
+	pacerBlocked = time.Millisecond
 	// A departure-rate sample spans at least pacerSample and pacerMinSends, so
 	// it averages over several congestion bursts. Measured burst by burst the
 	// rate is wildly wrong: on a 1% / 50 ms path quic-go pops a window's worth
 	// of datagrams in a few hundred microseconds and then waits an RTT, so
 	// consecutive blocked sends are ~250 µs apart on a wire carrying one
-	// datagram every ~7 ms (vrek iss-dy53a59).
+	// datagram every ~4 ms (vrek iss-dy53a59).
 	pacerSample   = 200 * time.Millisecond
 	pacerMinSends = 16
-	// pacerMaxWait caps one hold-off. The depth estimate is a belief, and a
-	// belief nothing refutes while it is being acted on is how a sender stalls
-	// itself: past the cap it sends anyway, and the send says whether the queue
-	// really was full.
+	// pacerMaxWait caps one wait, so a wake can be noticed and the estimate
+	// re-checked. It does not shorten a hold-off: the loop waits again.
 	pacerMaxWait = 50 * time.Millisecond
-	// When the queue looks empty the pacer, not the wire, is the bottleneck, so
-	// the estimate is nudged faster by pacerProbeNum / pacerProbeDen, at most
-	// once per pacerProbeEvery. Tying it to an empty queue is what keeps it
-	// from inflating a queue that is already the right depth.
-	pacerProbeEvery = 200 * time.Millisecond
-	pacerProbeNum   = 99
-	pacerProbeDen   = 100
+	// pacerBlockedQuarters is how much of a sample window must have blocked for
+	// the sample to count, in quarters of its sends. A sample taken while the
+	// queue was sometimes empty measures what the sender offered rather than
+	// what the wire can carry, and pacing to that offers less still — the
+	// estimate walks itself down and takes the throughput with it. Blocking
+	// often is the sender's only evidence that the wire, and not the sender,
+	// set the pace.
+	pacerBlockedQuarters = 1
+	// pacerHeadroom is the fraction of the wire the sender leaves unused, as a
+	// divisor. Pacing at exactly the measured rate conserves the queue's depth
+	// rather than reducing it: as many datagrams arrive as leave, so a queue
+	// that is full stays full. Only sending slightly slower than the wire
+	// drains it, and this is the price of a shallow one — the throughput given
+	// up is this fraction, and it is the trade the issue is about.
+	pacerHeadroom = 8
 )
 
 // pacer keeps quic-go's datagram send queue shallow, so a packet the send loop
@@ -49,36 +61,46 @@ const (
 // onto the wire: on a slow path those 32 datagrams are ~125 ms of head-of-line
 // delay for a small reply granted now.
 //
-// Nothing reports "this datagram left", so the depth is inferred:
-//   - A send that blocks waited for a datagram to leave, so at that instant the
-//     queue is full: the depth is known exactly, and it is 32.
-//   - Between two blocked sends the depth therefore starts and ends at 32, so
-//     however bursty the wire was in between, exactly as many datagrams left as
-//     were handed over. Counting sends between two blocks, over a span long
-//     enough to cover several bursts, measures the departure rate.
-//   - Between departures the depth is dead-reckoned from that rate.
+// Nothing reports "this datagram left", so the rate is inferred. A send that
+// blocks waited for one to leave, so at that instant the queue is full. Between
+// two blocked sends it is therefore full at both ends, and exactly as many
+// datagrams left as were handed over, however bursty the wire was in between:
+// counting sends between two blocks, over a span long enough to cover several
+// bursts, measures the departure rate.
 //
-// The estimate is self-correcting in both directions. Too fast fills the queue,
-// which blocks, which re-measures the rate and re-syncs the depth. Too slow
-// empties the queue, which is the only case where pacing costs throughput, and
-// that is exactly when probing nudges it faster.
+// Knowing the rate, the sender books a departure slot per bulk datagram, and a
+// block — which proves the queue is full — books a slot far enough out for the
+// queue to drain to the target first. That drain costs no throughput, because
+// the wire is busy draining throughout it. What it must not do is happen when
+// the queue is *not* full: braking on a belief that nothing refutes while it is
+// acted on is how a sender stalls itself, and an earlier revision of this file
+// lost 56% of bulk throughput that way. So only an observed block brakes, and
+// the rest of the time the sender simply paces.
 //
-// Only bulk is ever held back (work.bulk): an RPC with more left than the queue
-// holds is limited by the wire, so the wait costs it nothing, while a small
-// reply is mostly queueing delay and is never made to wait. Holding everything
-// back instead throttles a sender that has only small replies to send to below
-// its own offered load, which cost a benchmark run to learn.
+// Slots missed while the sender had nothing to send are kept as credit, up to
+// target of them, so pacing tracks the wire rather than falling behind it by
+// the timer's error on every send.
+//
+// Nothing nudges the estimate faster on its own. It is tempting: a sender that
+// paces a little slower than the wire empties the queue and never learns, and
+// gives up that much throughput. But a shallow queue is indistinguishable from
+// an empty one — neither blocks — so such a nudge fires in exactly the state it
+// is meant to detect, and ratchets until the queue is full again. Simulated
+// against an even wire it holds the queue 15-20 deep against a target of 4. The
+// rate therefore only ever comes from a sample taken while the queue was full,
+// which is the only time the wire is known to be busy; a path that speeds up is
+// under-used until something fills the queue again.
 //
 // Pure logic with the clock passed in, so it can be tested without a network.
 type pacer struct {
-	target   int           // datagrams allowed to sit in the queue
+	target   int           // datagrams allowed out back to back
 	interval time.Duration // estimated time between departures; 0 until measured
-	depth    float64       // estimated datagrams queued
-	at       time.Time     // when depth was last brought up to date
+	next     time.Time     // earliest the next bulk datagram may be handed over
 
-	since   time.Time // the blocked send the current sample counts from
-	sends   int       // datagrams handed over since then, which is how many left
-	probeAt time.Time // when the interval was last nudged
+	since    time.Time // the blocked send the current sample counts from
+	sends    int       // datagrams handed over since then, which is how many left
+	blocks   int       // how many of those blocked, which says who set the pace
+	blockRun int       // blocked sends in a row; one alone may just be a slow send
 }
 
 // wait reports how long to hold off before handing quic-go another bulk
@@ -92,13 +114,43 @@ func (p *pacer) wait(now time.Time) time.Duration {
 	if p.interval < pacerMinInterval {
 		return 0 // the queue drains faster than pacing could usefully hold it
 	}
-	p.advance(now)
-	over := p.depth - float64(p.target)
-	if over < 0 {
+	d := p.next.Sub(now)
+	if d <= 0 {
 		return 0
 	}
-	// Hold off for the departures that bring the queue back under target.
-	return min(time.Duration((over+1)*float64(p.interval)), pacerMaxWait)
+	return min(d, pacerMaxWait)
+}
+
+// sent records one datagram handed to quic-go, and whether that blocked.
+func (p *pacer) sent(now time.Time, blocked bool) {
+	p.schedule(now)
+	p.sends++
+	if !blocked {
+		p.blockRun = 0
+		return
+	}
+	p.blockRun++
+	// The queue is full, so nothing handed over now can leave before the 32
+	// ahead of it. Stand back for the departures that bring it to the target —
+	// but only once a second send in a row has confirmed the queue really is
+	// full, since braking for 28 departures that have already happened is how
+	// the sender throttles itself.
+	if p.interval > 0 && p.blockRun > 1 {
+		p.next = now.Add(time.Duration(quicSendQueue-p.target) * p.interval)
+	}
+	if p.since.IsZero() {
+		p.since, p.sends, p.blocks = now, 0, 0
+		return
+	}
+	p.blocks++
+	// The queue was full then and is full now, so p.sends datagrams left in
+	// between. Long samples only: a short one measures a burst, not the wire.
+	if d := now.Sub(p.since); d >= pacerSample && p.sends >= pacerMinSends {
+		if 4*p.blocks >= pacerBlockedQuarters*p.sends {
+			p.observe(d / time.Duration(p.sends))
+		}
+		p.since, p.sends, p.blocks = now, 0, 0
+	}
 }
 
 // idle records that the send loop ran out of work. Datagrams kept leaving while
@@ -109,43 +161,19 @@ func (p *pacer) idle() {
 	p.since, p.sends = time.Time{}, 0
 }
 
-// sent records one datagram handed to quic-go, and whether that blocked.
-func (p *pacer) sent(now time.Time, blocked bool) {
-	p.advance(now)
-	p.depth++
-	p.sends++
-	if !blocked {
-		p.probe(now)
-		return
-	}
-	// It blocked, so the queue was full and one datagram left to make room:
-	// the depth is exactly the queue length again.
-	p.depth = quicSendQueue
-	p.at = now
-	if p.since.IsZero() {
-		p.since, p.sends = now, 0
-		return
-	}
-	// The queue was full then and is full now, so p.sends datagrams left in
-	// between. Long samples only: a short one measures a burst, not the wire.
-	if d := now.Sub(p.since); d >= pacerSample && p.sends >= pacerMinSends {
-		p.observe(d / time.Duration(p.sends))
-		p.since, p.sends = now, 0
-	}
-}
-
-// advance brings the depth estimate up to date: the wire has been draining the
-// queue since it was last evaluated.
-func (p *pacer) advance(now time.Time) {
+// schedule books the slot after this datagram's. Slots that went unused are
+// kept as credit, but only target of them, so a sender coming back from idle
+// hands over that many at once and no more.
+func (p *pacer) schedule(now time.Time) {
 	if p.interval <= 0 {
-		p.at = now
+		p.next = now
 		return
 	}
-	if d := now.Sub(p.at); d > 0 && !p.at.IsZero() {
-		p.depth -= float64(d) / float64(p.interval)
+	slot := p.interval + p.interval/pacerHeadroom
+	if credit := now.Add(-time.Duration(p.target) * slot); p.next.Before(credit) {
+		p.next = credit
 	}
-	p.depth = max(p.depth, 0)
-	p.at = now
+	p.next = p.next.Add(slot)
 }
 
 // observe folds one departure-interval sample into the estimate.
@@ -156,19 +184,5 @@ func (p *pacer) observe(sample time.Duration) {
 		p.interval = sample
 	default:
 		p.interval = (3*p.interval + sample) / 4 // EWMA, α = ¼
-	}
-}
-
-// probe nudges the estimate faster when the queue looks empty: the wire is
-// then waiting on us rather than the other way round.
-func (p *pacer) probe(now time.Time) {
-	if p.interval <= 0 || p.depth > 1 {
-		return
-	}
-	if p.probeAt.IsZero() || now.Sub(p.probeAt) >= pacerProbeEvery {
-		if !p.probeAt.IsZero() {
-			p.interval = p.interval * pacerProbeNum / pacerProbeDen
-		}
-		p.probeAt = now
 	}
 }

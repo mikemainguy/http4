@@ -569,9 +569,11 @@ func (s *session) transmit(b []byte) error {
 	if err != nil {
 		return err
 	}
-	blocked := at.Sub(start) >= pacerBlocked
+	took := at.Sub(start)
+	blocked := took >= pacerBlocked
 	if blocked {
 		s.m.SendBlocked.Add(1)
+		s.m.SendBlockedMicros.Add(took.Microseconds())
 	}
 	s.pacer.sent(at, blocked)
 	s.m.PacerIntervalUs.Store(s.pacer.interval.Microseconds())
