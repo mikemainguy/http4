@@ -37,7 +37,7 @@ func (s *Server) handleH3Asset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := strings.TrimPrefix(r.URL.Path, H3Path)
-	a, err := s.assets.Get(id)
+	a, err := s.pool.Get(id)
 	if err != nil {
 		if errors.Is(err, sender.ErrNotFound) {
 			http.NotFound(w, r)

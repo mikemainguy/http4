@@ -58,6 +58,13 @@ export interface HarnessOptions {
    * the forced origin is the proxy, so h3 crosses the same impaired path.
    */
   h3?: boolean;
+  /**
+   * Run `http4d serve <dir>` instead of the sandbox server: `assetsDir` is
+   * then the site directory (pages and assets both), and the client bundle
+   * comes from the one embedded by `npm run build`. `extraArgs` are serve's
+   * flags.
+   */
+  serve?: boolean;
 }
 
 /** `extraArgs` go to http4d, e.g. ["-drop", "every=7"]. */
@@ -69,8 +76,12 @@ export async function startHarness(assetsDir: string, extraArgs: string[] = [], 
   // The proxy's address must be advertised before the proxy can start (it
   // needs the server's listener as its target), so reserve a port for it.
   const proxyAddr = opts.impair ? `127.0.0.1:${await freeUdpPort()}` : undefined;
-  const args = ["-http", "127.0.0.1:0", "-wt", "127.0.0.1:0", "-static", path.join(root, "client"), "-assets", assetsDir, ...extraArgs];
+  const args = opts.serve
+    ? ["serve", "-http", "127.0.0.1:0", "-wt", "127.0.0.1:0", ...extraArgs]
+    : ["-http", "127.0.0.1:0", "-wt", "127.0.0.1:0", "-static", path.join(root, "client"), "-assets", assetsDir, ...extraArgs];
   if (proxyAddr) args.push("-advertise-wt", proxyAddr);
+  if (opts.serve) args.push(assetsDir); // serve's flags must come before the site
+
   const server = spawn(bin, args, { stdio: ["ignore", "pipe", "inherit"] });
   let proxy: ChildProcess | undefined;
   let proxyLines: ReturnType<typeof createInterface> | undefined;

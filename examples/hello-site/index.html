@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hello, HTTP4</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <img class="banner" src="images/banner.png" alt="" width="240" height="48" />
+    <h1>Hello, HTTP4</h1>
+    <p id="greeting">Loading…</p>
+    <p><img id="badge" alt="badge" width="48" height="48" /></p>
+    <h2>How each request was served</h2>
+    <table id="report">
+      <thead><tr><th>URL</th><th>transport</th><th>status</th><th>bytes</th><th>ms</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <p id="status"></p>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

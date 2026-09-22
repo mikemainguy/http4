@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -48,6 +49,18 @@ type Config struct {
 	// AssetPrefix is the HTTP path the asset pool is also served under, for
 	// clients falling back from HTTP4. Default DefaultAssetPrefix.
 	AssetPrefix string
+
+	// SiteDir switches to serve mode (`http4d serve`): this one directory is
+	// both the site's pages and its asset pool. Every path is an asset (the
+	// advertised asset prefix is "/", and asset ID = path without the leading
+	// slash), served over HTTP4 and, by the same name, over plain HTTP.
+	// StaticDir, AssetsDir and AssetPrefix are ignored; dotfiles are hidden.
+	SiteDir string
+	// ClientFS holds the built browser client, served under ClientPath and
+	// (its http4-sw.js) at ServiceWorker. Serve mode only; nil = not served.
+	ClientFS fs.FS
+	// NoH3 turns off the plain-HTTP/3 baseline route (H3Path).
+	NoH3 bool
 }
 
 // ClientConfig is served at /config.json so the page never hard-codes the
@@ -62,6 +75,9 @@ type ClientConfig struct {
 	// for ordinary fetches, which serverCertificateHashes does not cover.
 	H3URL    string `json:"h3Url"`
 	SPKIHash string `json:"spkiHash"`
+	// AssetPrefix is the same-origin HTTP path prefix whose URLs are HTTP4
+	// assets (URL = prefix + asset ID): "/" in serve mode.
+	AssetPrefix string `json:"assetPrefix"`
 }
 
 type Server struct {
@@ -69,15 +85,19 @@ type Server struct {
 	WebTransportURL string // as advertised to clients
 	WTListenAddr    string // where the UDP listener actually is
 
-	cert     *devcert.Cert
-	assets   *sender.DirAssets
-	metrics  *sender.Metrics
-	httpPort int
-	httpLn   net.Listener
-	udpConn  net.PacketConn
-	httpSrv  *http.Server
-	wtSrv    *webtransport.Server
-	serveErr chan error
+	cert        *devcert.Cert
+	assets      *sender.DirAssets
+	pool        sender.Assets // what HTTP, HTTP4 and h3 read: assets, filtered in serve mode
+	assetPrefix string
+	clientFS    fs.FS
+	noH3        bool
+	metrics     *sender.Metrics
+	httpPort    int
+	httpLn      net.Listener
+	udpConn     net.PacketConn
+	httpSrv     *http.Server
+	wtSrv       *webtransport.Server
+	serveErr    chan error
 }
 
 // Start binds both listeners and begins serving. Port 0 in either address picks
@@ -87,17 +107,25 @@ func Start(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	assetPrefix := cmp.Or(cfg.AssetPrefix, DefaultAssetPrefix)
-	if err := checkAssetPrefix(assetPrefix); err != nil {
-		return nil, err
+	siteMode := cfg.SiteDir != ""
+	assetPrefix, assetsDir := "/", cfg.SiteDir
+	if !siteMode {
+		assetPrefix, assetsDir = cmp.Or(cfg.AssetPrefix, DefaultAssetPrefix), cfg.AssetsDir
+		if err := checkAssetPrefix(assetPrefix); err != nil {
+			return nil, err
+		}
 	}
 	newDropper, err := sender.ParseDropSpec(cfg.DropSpec)
 	if err != nil {
 		return nil, err
 	}
-	assets, err := sender.OpenDir(cfg.AssetsDir)
+	assets, err := sender.OpenDir(assetsDir)
 	if err != nil {
 		return nil, fmt.Errorf("assets: %w", err)
+	}
+	var pool sender.Assets = assets
+	if siteMode {
+		pool = visibleAssets{assets}
 	}
 	httpLn, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {
@@ -117,6 +145,10 @@ func Start(cfg Config) (*Server, error) {
 		WTListenAddr:    udpConn.LocalAddr().String(),
 		cert:            cert,
 		assets:          assets,
+		pool:            pool,
+		assetPrefix:     assetPrefix,
+		clientFS:        cfg.ClientFS,
+		noH3:            cfg.NoH3,
 		metrics:         new(sender.Metrics),
 		httpPort:        httpLn.Addr().(*net.TCPAddr).Port,
 		httpLn:          httpLn,
@@ -134,17 +166,27 @@ func Start(cfg Config) (*Server, error) {
 	}
 	wtMux := http.NewServeMux()
 	wtMux.HandleFunc(WebTransportPath, s.upgrade(func(sess *webtransport.Session) {
-		sender.Serve(sess.Context(), sess, sender.Config{Assets: s.assets, Metrics: s.metrics, NewDropper: newDropper})
+		sender.Serve(sess.Context(), sess, sender.Config{Assets: s.pool, Metrics: s.metrics, NewDropper: newDropper})
 	}))
 	wtMux.HandleFunc(EchoPath, s.upgrade(echoDatagrams))
-	wtMux.HandleFunc(H3Path, s.handleH3Asset)
+	if !cfg.NoH3 {
+		wtMux.HandleFunc(H3Path, s.handleH3Asset)
+	}
 	h3.Handler = wtMux
 
 	httpMux := http.NewServeMux()
 	httpMux.HandleFunc("/config.json", s.handleConfig)
 	httpMux.HandleFunc("/metrics.json", s.handleMetrics)
-	httpMux.Handle(assetPrefix, http.StripPrefix(assetPrefix, http.HandlerFunc(s.handleAsset)))
-	httpMux.Handle("/", http.FileServer(http.Dir(cfg.StaticDir)))
+	if siteMode {
+		if cfg.ClientFS != nil {
+			httpMux.Handle(ClientPath, s.handleClient(""))
+			httpMux.Handle(ServiceWorker, s.handleClient(serviceWorkerFile))
+		}
+		httpMux.HandleFunc("/", s.handleSite)
+	} else {
+		httpMux.Handle(assetPrefix, http.StripPrefix(assetPrefix, http.HandlerFunc(s.handleAsset)))
+		httpMux.Handle("/", http.FileServer(http.Dir(cfg.StaticDir)))
+	}
 	s.httpSrv = &http.Server{Handler: httpMux, ReadHeaderTimeout: 5 * time.Second}
 
 	go func() { s.serveErr <- s.httpSrv.Serve(httpLn) }()
@@ -173,9 +215,17 @@ func (s *Server) ClientConfig() ClientConfig {
 		WebTransportURL: s.WebTransportURL,
 		EchoURL:         strings.TrimSuffix(s.WebTransportURL, WebTransportPath) + EchoPath,
 		CertHash:        base64.StdEncoding.EncodeToString(s.cert.Hash[:]),
-		H3URL:           strings.TrimSuffix(s.WebTransportURL, WebTransportPath) + H3Path,
+		H3URL:           s.h3URL(),
 		SPKIHash:        base64.StdEncoding.EncodeToString(s.cert.SPKIHash[:]),
+		AssetPrefix:     s.assetPrefix,
 	}
+}
+
+func (s *Server) h3URL() string {
+	if s.noH3 {
+		return ""
+	}
+	return strings.TrimSuffix(s.WebTransportURL, WebTransportPath) + H3Path
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, _ *http.Request) {

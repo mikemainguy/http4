@@ -1,0 +1,14 @@
+#!/bin/sh
+# Copy the built browser client (client/dist/*.js and their source maps) into
+# the Go embed directory, so the next `go build` of http4d carries it and
+# `http4d serve` is standalone. Runs automatically after `npm run build`
+# (the postbuild script). The copies are gitignored.
+set -eu
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+SRC="$ROOT/client/dist"
+DST="$ROOT/server/internal/clientdist/dist"
+[ -f "$SRC/http4.js" ] || { echo "embed-client: $SRC/http4.js missing; build the client first" >&2; exit 1; }
+find "$DST" -mindepth 1 ! -name .gitkeep -exec rm -rf {} +
+cp "$SRC"/*.js "$DST"/
+for m in "$SRC"/*.js.map; do [ -e "$m" ] && cp "$m" "$DST"/; done
+echo "embed-client: $(ls "$DST" | wc -l | tr -d ' ') files -> server/internal/clientdist/dist"

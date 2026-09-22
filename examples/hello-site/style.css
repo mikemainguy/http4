@@ -1,0 +1,33 @@
+body {
+  font: 16px/1.5 system-ui, sans-serif;
+  max-width: 40rem;
+  margin: 2rem auto;
+  padding: 0 1rem;
+  color: #1d2733;
+  background: #f7f5f0;
+}
+
+.banner {
+  display: block;
+  border-radius: 6px;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 0.25rem 0.5rem;
+  border-bottom: 1px solid #d8d3c8;
+}
+
+td.http4 {
+  color: #1a7f37;
+}
+
+td.fallback {
+  color: #b35900;
+}

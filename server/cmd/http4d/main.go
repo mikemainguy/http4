@@ -1,10 +1,13 @@
-// Command http4d runs the HTTP4 sandbox server: the browser client over HTTP
-// and the HTTP4 datagram protocol over WebTransport.
+// Command http4d runs the HTTP4 server.
+//
+//	http4d serve [flags] <site-dir>   serve a static site over HTTP + HTTP4
+//	http4d [flags]                    the sandbox/test server (tests, integrity suite)
 package main
 
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -14,6 +17,23 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "serve" {
+		cfg, err := parseServe(os.Args[2:], os.Stderr)
+		if err == flag.ErrHelp {
+			os.Exit(0)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "http4d serve:", err)
+			os.Exit(2)
+		}
+		run(cfg)
+		return
+	}
+
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage: http4d [flags]  (sandbox server; to serve a site use `http4d serve -h`)\n")
+		flag.PrintDefaults()
+	}
 	httpAddr := flag.String("http", "127.0.0.1:8080", "TCP address serving the client page and /config.json")
 	wtAddr := flag.String("wt", "127.0.0.1:4433", "UDP address for WebTransport")
 	static := flag.String("static", "client", "directory served at /")
@@ -23,10 +43,15 @@ func main() {
 	advertiseWT := flag.String("advertise-wt", "", "host:port to advertise for WebTransport instead of -wt's, e.g. an impairment proxy in front of it")
 	flag.Parse()
 
-	srv, err := server.Start(server.Config{
+	run(server.Config{
 		HTTPAddr: *httpAddr, WTAddr: *wtAddr, StaticDir: *static, AssetsDir: *assets,
 		DropSpec: *drop, AdvertiseWT: *advertiseWT, AssetPrefix: *assetPrefix,
 	})
+}
+
+// run starts the server, announces it, and serves until SIGINT/SIGTERM.
+func run(cfg server.Config) {
+	srv, err := server.Start(cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -41,10 +66,14 @@ func main() {
 		"h3":           srv.ClientConfig().H3URL,
 		"spki":         srv.ClientConfig().SPKIHash,
 	})
-	if *drop != "" {
-		log.Printf("WARNING: injecting loss on outgoing DATA: %s", *drop)
+	if cfg.DropSpec != "" {
+		log.Printf("WARNING: injecting loss on outgoing DATA: %s", cfg.DropSpec)
 	}
-	log.Printf("open %s", srv.HTTPURL)
+	if cfg.SiteDir != "" {
+		log.Printf("serving %s at %s (HTTP4 over %s)", cfg.SiteDir, srv.HTTPURL, srv.WebTransportURL)
+	} else {
+		log.Printf("open %s", srv.HTTPURL)
+	}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
