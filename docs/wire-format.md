@@ -1,10 +1,15 @@
-# HTTP4 Datagram Wire Format — v0
+# HTTP4 Datagram Wire Format — v1
 
 The packet format for the HTTP4 sandbox. It refines §3 of the proposal (vrek
 `doc-sjj28a2`) and fills in the parts the proposal leaves undefined. The golden
 vectors in [`testdata/wire/vectors.json`](../testdata/wire/vectors.json) are
 normative: the Go (`server/internal/wire`) and TypeScript
 (`client/src/wire.ts`) codecs must both encode and decode them byte for byte.
+
+v1 adds the META packet (0x06) so that a response can carry its
+Content-Type and validators (vrek iss-tj4v2z2). Without them Chrome refuses
+HTTP4-delivered module scripts (strict MIME checking; vrek finding
+`fnd-7ecs69k`). v0 packets are unchanged.
 
 ## Transport
 
@@ -35,7 +40,7 @@ encryption layer of its own.
 
 | Offset | Size | Field  | Notes |
 |---|---|---|---|
-| 0 | 1 | `type`   | `0x01` REQ, `0x02` DATA, `0x03` GRANT, `0x04` RESEND, `0x05` ERROR |
+| 0 | 1 | `type`   | `0x01` REQ, `0x02` DATA, `0x03` GRANT, `0x04` RESEND, `0x05` ERROR, `0x06` META |
 | 1 | 8 | `rpc_id` | Chosen by the client: 8 bytes from `crypto.getRandomValues`. Scopes every later packet of that request/response. |
 
 `rpc_id` is only a correlation handle. QUIC already authenticates the
@@ -61,7 +66,8 @@ client did not authorize, which is what goal G2 measures (zero un-granted
 bytes, with no exception for a first burst).
 
 A retransmitted REQ reuses the same `rpc_id`. The server must treat it as the
-same RPC, never start a second one.
+same RPC, never start a second one, and answers it with META and packet 0
+again.
 
 ### `0x02` DATA — server → client (17 + n bytes)
 
@@ -113,6 +119,40 @@ failed request gets an answer instead of silence. A decoder accepts unknown
 `code` values so that codes can be added later without breaking older
 decoders.
 
+### `0x06` META — server → client (10 + fields bytes)
+
+| Offset | Size | Field   | Notes |
+|---|---|---|---|
+| 9 | 1 | `count` | Number of fields that follow; at most 4. |
+
+Each field, repeated `count` times:
+
+| Size | Field       | Notes |
+|---|---|---|
+| 1 | `name_len`  | |
+| n | `name`      | One of `content-type`, `etag`, `last-modified`, `cache-control`, exactly as written (lowercase). |
+| 2 | `value_len` | |
+| m | `value`     | 1..65535 bytes of printable ASCII (0x20–0x7E), with no leading or trailing space. |
+
+A decoder rejects an unknown or differently-cased name, a repeated name, an
+empty or non-printable value, and trailing bytes after the last field. There
+is no `content-encoding`: DATA payloads are always the raw asset bytes. Fields
+keep their order on the wire; the server sends them in the order listed above.
+
+META is the response's metadata, like HTTP response headers:
+
+- **When:** the server sends META for an RPC immediately before its packet 0,
+  and again before packet 0 whenever a repeated REQ arrives. It never sends
+  META for a request that got ERROR.
+- **Grants:** META is not body data, so it needs no grant and never counts
+  toward G2's un-granted bytes.
+- **Size:** META must fit in one datagram. The server keeps it within 512
+  bytes, dropping the least important fields (cache-control, then
+  last-modified, then etag) rather than exceed that.
+- **Completion:** the client treats a request as complete only when it has
+  both every body byte and the META. If the body is complete and META is
+  missing, it recovers the same way as for a lost packet 0: it repeats the REQ.
+
 ## Size limits at a glance
 
 | Type   | Size        | At `maxDatagramSize` = 1024 |
@@ -122,3 +162,4 @@ decoders.
 | GRANT  | 14          | |
 | RESEND | 17          | |
 | ERROR  | 10          | |
+| META   | 10 + Σ(3 + name + value) | server keeps it ≤ 512 |

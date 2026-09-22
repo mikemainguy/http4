@@ -154,8 +154,8 @@ func TestIsLoopbackOrigin(t *testing.T) {
 
 // An HTTP4 fetch through the real server over real QUIC: REQ with a small
 // initial grant, then GRANTs in 16 KiB steps as data arrives (with RESEND if
-// the transfer stalls), until the whole asset is in. The server's G2 counter
-// must still be 0 afterwards.
+// the transfer stalls), until the whole asset and its META are in. The
+// server's G2 counter must still be 0 afterwards.
 func TestHTTP4FetchOverQUIC(t *testing.T) {
 	const size = 300_000
 	a := make([]byte, size)
@@ -185,9 +185,10 @@ func TestHTTP4FetchOverQUIC(t *testing.T) {
 	buf := make([]byte, size)
 	have := make([]bool, size)
 	received, granted := 0, uint32(window)
+	var meta *wire.Meta
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	for received < size {
+	for received < size || meta == nil {
 		rctx, rcancel := context.WithTimeout(ctx, 200*time.Millisecond)
 		b, err := sess.ReceiveDatagram(rctx)
 		rcancel()
@@ -204,7 +205,7 @@ func TestHTTP4FetchOverQUIC(t *testing.T) {
 			for end < granted && !have[end] {
 				end++
 			}
-			if start < end {
+			if start < end && meta != nil {
 				send(&wire.Resend{RPCID: rpc, Start: start, End: end})
 			} else {
 				send(&wire.Req{RPCID: rpc, InitialGrant: window, AssetID: "big.bin"})
@@ -214,6 +215,13 @@ func TestHTTP4FetchOverQUIC(t *testing.T) {
 		p, err := wire.Decode(b)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if m, ok := p.(*wire.Meta); ok && m.RPCID == rpc {
+			if meta == nil && received > 0 {
+				t.Errorf("META arrived after DATA; it must lead packet 0")
+			}
+			meta = m
+			continue
 		}
 		d, ok := p.(*wire.Data)
 		if !ok || d.RPCID != rpc || d.TotalSize != size {
@@ -241,10 +249,16 @@ func TestHTTP4FetchOverQUIC(t *testing.T) {
 	if !bytes.Equal(buf, a) {
 		t.Fatal("reassembled asset differs")
 	}
+	if ct, _ := meta.Get("content-type"); ct != "application/octet-stream" {
+		t.Errorf("content-type = %q, want application/octet-stream", ct)
+	}
+	if _, ok := meta.Get("last-modified"); !ok {
+		t.Error("META from a directory asset has no last-modified")
+	}
 	m := s.Metrics()
 	t.Logf("server metrics: %+v", m)
-	if m.UngrantedSent != 0 || m.RPCs != 1 {
-		t.Errorf("metrics %+v: want 0 un-granted bytes and 1 RPC", m)
+	if m.UngrantedSent != 0 || m.RPCs != 1 || m.MetaPackets < 1 {
+		t.Errorf("metrics %+v: want 0 un-granted bytes, 1 RPC, and META sent", m)
 	}
 }
 

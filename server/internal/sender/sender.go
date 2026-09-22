@@ -92,6 +92,7 @@ type span struct{ start, end uint32 }
 type rpc struct {
 	id    wire.RPCID
 	asset []byte
+	meta  *wire.Meta // sent before packet 0, and again with it on a repeated REQ
 	size  uint32
 
 	// All fields below are guarded by session.mu.
@@ -103,6 +104,7 @@ type rpc struct {
 
 	// Written by the send loop:
 	next        uint32 // first byte never sent
+	metaSent    uint64 // REQ generation the last META answered
 	packet0Sent uint64
 }
 
@@ -154,7 +156,7 @@ func (s *session) handle(p wire.Packet) {
 	case *wire.Req:
 		r := s.rpcs[p.RPCID]
 		if r == nil {
-			asset, err := s.cfg.Assets.Get(p.AssetID)
+			a, err := s.cfg.Assets.Get(p.AssetID)
 			switch {
 			case errors.Is(err, ErrNotFound):
 				s.reply(&wire.Error{RPCID: p.RPCID, Code: wire.CodeNotFound})
@@ -164,12 +166,12 @@ func (s *session) handle(p wire.Packet) {
 				s.reply(&wire.Error{RPCID: p.RPCID, Code: wire.CodeBadRequest})
 				return
 			}
-			r = &rpc{id: p.RPCID, asset: asset, size: uint32(len(asset))}
+			r = &rpc{id: p.RPCID, asset: a.Body, meta: a.Meta(p.RPCID), size: uint32(len(a.Body))}
 			s.rpcs[p.RPCID] = r
 			s.m.RPCs.Add(1)
 		}
-		// A repeated REQ means the client never saw packet 0: send it again.
-		// Its initial_grant counts like any other grant.
+		// A repeated REQ means the client is missing META or packet 0: send
+		// both again. Its initial_grant counts like any other grant.
 		r.packet0Req++
 		r.raiseGrant(p.InitialGrant)
 		r.lastActive = now
@@ -216,13 +218,14 @@ type work struct {
 	pkt     wire.Packet
 	r       *rpc
 	kind    workKind
-	packet0 uint64 // for workPacket0: the request generation this answers
+	packet0 uint64 // for workMeta/workPacket0: the request generation this answers
 }
 
 type workKind int
 
 const (
 	workControl workKind = iota
+	workMeta
 	workPacket0
 	workResend
 	workNew
@@ -258,8 +261,9 @@ func (s *session) sendLoop(ctx context.Context) {
 	}
 }
 
-// pick chooses the next packet. Order: control replies, then packet 0s, then
-// resends, then new data. Among RPCs it takes the one with the fewest bytes
+// pick chooses the next packet. Order: control replies, then META, then
+// packet 0s, then resends, then new data. So an RPC's META always leaves just
+// ahead of its packet 0. Among RPCs it takes the one with the fewest bytes
 // left (SRPT), matching the client's scheduler. Caller holds s.mu.
 func (s *session) pick() (work, bool) {
 	if len(s.pending) > 0 {
@@ -281,6 +285,8 @@ func (s *session) pick() (work, bool) {
 	}
 	r := best
 	switch bestKind {
+	case workMeta:
+		return work{pkt: r.meta, r: r, kind: workMeta, packet0: r.packet0Req}, true
 	case workPacket0:
 		n := min(uint32(s.chunk), r.granted)
 		return work{pkt: r.data(0, n), r: r, kind: workPacket0, packet0: r.packet0Req}, true
@@ -297,6 +303,8 @@ func (s *session) pick() (work, bool) {
 // due reports the most urgent kind of packet r has waiting, if any.
 func (r *rpc) due() (workKind, bool) {
 	switch {
+	case r.packet0Req > r.metaSent:
+		return workMeta, true
 	case r.packet0Req > r.packet0Sent:
 		return workPacket0, true
 	case len(r.resends) > 0:
@@ -315,6 +323,7 @@ func (r *rpc) data(off, n uint32) *wire.Data {
 // connection is unusable.
 func (s *session) send(ctx context.Context, w work) bool {
 	d, isData := w.pkt.(*wire.Data)
+	_, isMeta := w.pkt.(*wire.Meta)
 	if isData {
 		// G2 check. This is the one place DATA leaves the server, so it is
 		// the one place the grant is checked. The packet is still sent: the
@@ -338,6 +347,8 @@ func (s *session) send(ctx context.Context, w work) bool {
 	if isData && s.drop != nil && s.drop(w.dropInfo(d)) {
 		// Simulated loss: record it as sent, as if it vanished on the wire.
 		s.m.DroppedData.Add(1)
+	} else if isMeta && s.drop != nil && s.drop(DropInfo{Meta: true, Resend: w.r.metaSent > 0}) {
+		s.m.DroppedMeta.Add(1)
 	} else if err := s.conn.SendDatagram(b); err != nil {
 		var tooLarge *quic.DatagramTooLargeError
 		if errors.As(err, &tooLarge) && isData {
@@ -361,6 +372,12 @@ func (s *session) send(ctx context.Context, w work) bool {
 	case workControl:
 		s.pending = s.pending[1:]
 		s.m.ErrorsSent.Add(1)
+		return true
+	case workMeta:
+		// META is metadata, not body bytes: no grant covers it and it never
+		// counts toward UngrantedSent.
+		w.r.metaSent = w.packet0
+		s.m.MetaPackets.Add(1)
 		return true
 	case workPacket0:
 		w.r.packet0Sent = w.packet0

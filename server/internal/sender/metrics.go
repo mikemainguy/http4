@@ -16,6 +16,8 @@ type Metrics struct {
 	RPCsEvicted   atomic.Int64
 	UngrantedSent atomic.Int64 // G2: payload bytes sent past the RPC's grant; must stay 0
 	DroppedData   atomic.Int64 // DATA packets discarded by loss injection (testing only)
+	MetaPackets   atomic.Int64 // META packets sent, first transmissions and repeats
+	DroppedMeta   atomic.Int64 // META packets discarded by loss injection (testing only)
 }
 
 // Snapshot is Metrics as plain values, for JSON.
@@ -32,6 +34,8 @@ type Snapshot struct {
 	RPCsEvicted   int64 `json:"rpcs_evicted"`
 	UngrantedSent int64 `json:"ungranted_bytes_sent"`
 	DroppedData   int64 `json:"dropped_data_packets"`
+	MetaPackets   int64 `json:"meta_packets"`
+	DroppedMeta   int64 `json:"dropped_meta_packets"`
 }
 
 func (m *Metrics) Snapshot() Snapshot {
@@ -48,5 +52,7 @@ func (m *Metrics) Snapshot() Snapshot {
 		RPCsEvicted:   m.RPCsEvicted.Load(),
 		UngrantedSent: m.UngrantedSent.Load(),
 		DroppedData:   m.DroppedData.Load(),
+		MetaPackets:   m.MetaPackets.Load(),
+		DroppedMeta:   m.DroppedMeta.Load(),
 	}
 }
