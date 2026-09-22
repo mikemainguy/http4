@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "vrek": {
+      "command": "vrek-mcp",
+      "env": {
+        "VREK_ACTOR": "claude",
+        "VREK_ACTOR_KIND": "agent",
+        "VREK_MODEL": "claude-opus-5"
+      }
+    }
+  }
+}

@@ -1,0 +1,6 @@
+# vrek: live SQLite state is rebuilt from .vrek/log.ndjson (vrek_import); only the log is tracked
+.vrek/workspace.db
+.vrek/workspace.db-*
+
+# machine-local Claude Code settings
+.claude/settings.local.json
