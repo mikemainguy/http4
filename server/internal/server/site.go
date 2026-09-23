@@ -6,6 +6,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"path"
 	"strings"
 
 	"http4/server/internal/clientdist"
@@ -48,6 +49,14 @@ func (s *Server) handleSite(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		// A single-page app routes in the browser, so a deep link like
+		// /dashboard/settings names no file and must still load the shell.
+		if s.spa && isNavigation(r) {
+			if idx, err := s.pool.Get("index.html"); err == nil {
+				writeAsset(w, r, idx)
+				return
+			}
+		}
 		http.NotFound(w, r)
 		return
 	}
@@ -56,6 +65,19 @@ func (s *Server) handleSite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeAsset(w, r, a)
+}
+
+// isNavigation reports whether this request is a browser asking for a page,
+// as opposed to a subresource. The SPA fallback must not answer a missing
+// script or stylesheet with HTML: the browser would reject it on MIME type and
+// the real error — the file is missing — would be hidden behind a confusing
+// one. Accept is the reliable signal; an extension in the path is a second,
+// weaker one, kept because some tooling omits Accept.
+func isNavigation(r *http.Request) bool {
+	if !strings.Contains(r.Header.Get("Accept"), "text/html") {
+		return false
+	}
+	return path.Ext(r.URL.Path) == ""
 }
 
 // handleClient serves a built client file from the embedded bundle or

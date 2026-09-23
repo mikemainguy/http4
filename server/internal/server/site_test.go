@@ -301,3 +301,63 @@ func fetchHTTP4(t *testing.T, sess *webtransport.Session, rpc wire.RPCID, id str
 		}
 	}
 }
+
+// A single-page app routes in the browser, so a deep link names no file and
+// must still load the shell. Off by default, because for an ordinary site a
+// missing page should be a 404 rather than the home page with status 200.
+func TestSPAFallback(t *testing.T) {
+	site := t.TempDir()
+	index := []byte("<!doctype html><title>app</title>")
+	for name, body := range map[string][]byte{"index.html": index, "app.js": []byte("//js")} {
+		if err := os.WriteFile(filepath.Join(site, name), body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	get := func(s *Server, path, accept string) (*http.Response, []byte) {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodGet, s.HTTPURL+path, nil)
+		if accept != "" {
+			req.Header.Set("Accept", accept)
+		}
+		rsp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rsp.Body.Close()
+		b, _ := io.ReadAll(rsp.Body)
+		return rsp, b
+	}
+
+	off, err := Start(Config{HTTPAddr: "127.0.0.1:0", WTAddr: "127.0.0.1:0", SiteDir: site})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { off.Close() })
+	if rsp, _ := get(off, "/dashboard/settings", "text/html"); rsp.StatusCode != http.StatusNotFound {
+		t.Errorf("without -spa: deep link gave %s, want 404", rsp.Status)
+	}
+
+	on, err := Start(Config{HTTPAddr: "127.0.0.1:0", WTAddr: "127.0.0.1:0", SiteDir: site, SPA: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { on.Close() })
+
+	rsp, body := get(on, "/dashboard/settings", "text/html,application/xhtml+xml")
+	if rsp.StatusCode != http.StatusOK || !bytes.Equal(body, index) {
+		t.Errorf("deep link gave %s, %q; want 200 and the shell", rsp.Status, body)
+	}
+	// A real file still wins over the fallback.
+	if rsp, body := get(on, "/app.js", "*/*"); rsp.StatusCode != http.StatusOK || string(body) != "//js" {
+		t.Errorf("/app.js gave %s, %q", rsp.Status, body)
+	}
+	// A MISSING subresource must still 404: answering it with HTML would fail
+	// the browser's MIME check and hide the real error behind a confusing one.
+	if rsp, _ := get(on, "/missing.js", "*/*"); rsp.StatusCode != http.StatusNotFound {
+		t.Errorf("missing subresource gave %s, want 404", rsp.Status)
+	}
+	// Extensionless but not a navigation (no text/html): not the shell either.
+	if rsp, _ := get(on, "/api/thing", "application/json"); rsp.StatusCode != http.StatusNotFound {
+		t.Errorf("non-navigation gave %s, want 404", rsp.Status)
+	}
+}

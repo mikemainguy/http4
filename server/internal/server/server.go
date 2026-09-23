@@ -67,6 +67,11 @@ type Config struct {
 	// ClientFS holds the built browser client, served under ClientPath and
 	// (its http4-sw.js) at ServiceWorker. Serve mode only; nil = not served.
 	ClientFS fs.FS
+	// SPA serves index.html for a navigation to a path that names no file, so
+	// a single-page app's client-side routes survive a deep link or a reload.
+	// Off by default: for an ordinary site a missing page should be a 404, not
+	// the home page returned with status 200.
+	SPA bool
 	// NoH3 turns off the plain-HTTP/3 baseline route (H3Path).
 	NoH3 bool
 	// AltSvc advertises HTTP/3 on the UDP port with an Alt-Svc header, so a
@@ -137,6 +142,7 @@ type Server struct {
 	assetPrefix string
 	clientFS    fs.FS
 	noH3        bool
+	spa         bool
 	metrics     *sender.Metrics
 	httpScheme  string
 	httpPort    int
@@ -222,6 +228,7 @@ func Start(cfg Config) (*Server, error) {
 		assetPrefix:     assetPrefix,
 		clientFS:        cfg.ClientFS,
 		noH3:            cfg.NoH3,
+		spa:             cfg.SPA,
 		metrics:         new(sender.Metrics),
 		httpScheme:      scheme,
 		httpPort:        httpLn.Addr().(*net.TCPAddr).Port,
