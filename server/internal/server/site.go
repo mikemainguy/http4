@@ -31,7 +31,9 @@ func (s *Server) handleSite(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	id := strings.TrimPrefix(r.URL.Path, "/")
+	// The path under the mount prefix is the asset ID, so a mounted build
+	// keeps the same IDs it would have at the root.
+	id := strings.TrimPrefix(r.URL.Path, s.assetPrefix)
 	if id == "" || strings.HasSuffix(id, "/") {
 		id += "index.html"
 	}

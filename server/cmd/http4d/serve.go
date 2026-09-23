@@ -54,6 +54,8 @@ func parseServe(args []string, out io.Writer) (server.Config, error) {
 	var origins repeated
 	fs.Var(&origins, "origin", "extra page `origin` allowed to open HTTP4 sessions, e.g. https://demo.example\n(repeat for more). The server's own loopback origin is always allowed")
 	metrics := fs.String("metrics", "local", "who may read /metrics.json: `off|local|public` (local = loopback clients only)")
+	mountAt := fs.String("mount-at", "/", "URL `prefix` the site directory is served under, over HTTP4 and by the same\npath over plain HTTP. Use it with -pass-through to put http4d in front of an\napp: mount that app's static build, e.g. /_next/static/")
+	passThrough := fs.String("pass-through", "", "reverse-proxy every request outside -mount-at to this `origin` (e.g.\nhttp://localhost:3000) over plain HTTP. Those responses never travel over\nHTTP4: the wire format needs a complete body, so streamed and per-user\nresponses cannot use it")
 	spa := fs.Bool("spa", false, "single-page app: serve index.html for a navigation to a path that names no\nfile, so client-side routes survive a deep link or reload. A missing subresource\nstill 404s")
 	h3 := fs.Bool("h3", false, "also serve the site over plain HTTP/3 at /h3/ on the -wt port (the benchmark baseline)")
 	altSvc := fs.Bool("alt-svc", false, "advertise HTTP/3 on the -wt port, so browsers upgrade this origin on their own.\nApplies to the WHOLE origin, so it moves the plain-HTTP comparison from HTTP/2\nto HTTP/3: say which baseline a measurement used. Needs a trusted certificate")
@@ -114,6 +116,8 @@ func parseServe(args []string, out io.Writer) (server.Config, error) {
 		WTAddr:          *wtAddr,
 		SiteDir:         site,
 		ClientFS:        client,
+		MountAt:         *mountAt,
+		PassThrough:     *passThrough,
 		SPA:             *spa,
 		NoH3:            !*h3,
 		AltSvc:          *altSvc,

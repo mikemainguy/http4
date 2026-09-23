@@ -67,6 +67,18 @@ type Config struct {
 	// ClientFS holds the built browser client, served under ClientPath and
 	// (its http4-sw.js) at ServiceWorker. Serve mode only; nil = not served.
 	ClientFS fs.FS
+	// MountAt is the URL prefix SiteDir is served under, over HTTP4 and by the
+	// same path over plain HTTP. Default "/" (the whole origin). Set it to put
+	// http4d in front of an application server: mount that app's static build
+	// (e.g. "/_next/static/") and send everything else to PassThrough.
+	MountAt string
+	// PassThrough, if set, is an origin (e.g. "http://localhost:3000") that
+	// every request outside MountAt is reverse-proxied to, over plain HTTP,
+	// untouched. Those responses never go near HTTP4, which is the point: the
+	// wire format needs a complete, randomly-addressable body (total_size,
+	// byte-offset grants), so a streamed or per-user response cannot travel
+	// over it (vrek iss-sz6a8zk).
+	PassThrough string
 	// SPA serves index.html for a navigation to a path that names no file, so
 	// a single-page app's client-side routes survive a deep link or a reload.
 	// Off by default: for an ordinary site a missing page should be a 404, not
@@ -171,7 +183,19 @@ func Start(cfg Config) (*Server, error) {
 		return nil, errors.New("-redirect needs a real certificate (-cert file:... or acme)")
 	}
 	siteMode := cfg.SiteDir != ""
-	assetPrefix, assetsDir := "/", cfg.SiteDir
+	assetPrefix, assetsDir := cmp.Or(cfg.MountAt, "/"), cfg.SiteDir
+	if siteMode && assetPrefix != "/" {
+		if err := checkAssetPrefix(assetPrefix); err != nil {
+			return nil, fmt.Errorf("-mount-at: %w", err)
+		}
+		// The client's own files live at fixed paths; a mount that swallowed
+		// them would serve the page's bootstrap from the application's build.
+		for _, reserved := range []string{ClientPath, ServiceWorker, "/config.json"} {
+			if strings.HasPrefix(reserved, assetPrefix) {
+				return nil, fmt.Errorf("-mount-at %q would cover %q, which the client needs", assetPrefix, reserved)
+			}
+		}
+	}
 	if !siteMode {
 		assetPrefix, assetsDir = cmp.Or(cfg.AssetPrefix, DefaultAssetPrefix), cfg.AssetsDir
 		if err := checkAssetPrefix(assetPrefix); err != nil {
@@ -255,7 +279,22 @@ func Start(cfg Config) (*Server, error) {
 			httpMux.Handle(ClientPath, s.handleClient(""))
 			httpMux.Handle(ServiceWorker, s.handleClient(serviceWorkerFile))
 		}
-		httpMux.HandleFunc("/", s.handleSite)
+		httpMux.HandleFunc(assetPrefix, s.handleSite)
+		if cfg.PassThrough != "" {
+			proxy, err := newPassThrough(cfg.PassThrough)
+			if err != nil {
+				assets.Close()
+				httpLn.Close()
+				udpConn.Close()
+				if redirectLn != nil {
+					redirectLn.Close()
+				}
+				return nil, err
+			}
+			// Only reached for paths the mount does not cover, because Go's mux
+			// prefers the longer pattern.
+			httpMux.Handle("/", proxy)
+		}
 	} else {
 		httpMux.Handle(assetPrefix, http.StripPrefix(assetPrefix, http.HandlerFunc(s.handleAsset)))
 		httpMux.Handle("/", http.FileServer(http.Dir(cfg.StaticDir)))
