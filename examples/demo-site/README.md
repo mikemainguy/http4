@@ -155,6 +155,25 @@ The images are procedural: smooth colour fields plus fine grain, drawn from a fi
 the same bytes. The grain keeps them from compressing, so on the wire they behave like photos. `npm run demo` (and
 the tests) generate them into `img/`, which is gitignored.
 
+## Measuring it without fooling yourself
+
+Three DevTools settings change what a load actually does, and each has produced a misleading result here:
+
+- **"Disable cache"** (Network panel) — leave it **on** for any measurement. Otherwise Chrome's memory cache serves
+  the reload's images and stylesheet itself, they never reach the Service Worker, and the page looks instant while
+  transferring almost nothing. A load reporting a handful of grants is usually this.
+- **"Update on reload"** (Application → Service Workers) — turn it **off** except when you are deliberately picking
+  up a new worker build. With it on, the worker is torn down and re-installed on every load, so it loses the cached
+  per-tab answer to its `hello` handshake. Every request then waits for that handshake or falls back, which looks
+  like the site hanging.
+- **Throttling** (Network panel, and Performance → CPU) — it persists across sessions, so one left on from an
+  earlier experiment silently applies to everything afterwards. It also may not apply to WebTransport at all, which
+  would flatter HTTP4 while capping the baseline; impair the path outside the browser instead (`tc`/netem on the
+  server, or the `impair` proxy in front of both stacks).
+
+Check the panel's **"% of bytes over HTTP4"** before trusting any timing. If it is low, the comparison is measuring
+the fallback path on both sides and the numbers mean nothing.
+
 ## Tests
 
 `tests/demo/demo.test.ts` loads this site in headless Chrome under `http4d serve -h3`. It measures G7 (the share of
