@@ -28,3 +28,6 @@ testdata/assets/*
 examples/demo-site/img/
 bin/
 spikes/*/www/sw.js
+
+# DevTools traces: large, machine-specific captures kept out of the repo
+performance_recordings/
