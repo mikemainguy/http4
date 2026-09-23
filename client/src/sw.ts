@@ -9,7 +9,8 @@
 // that are down, and failed transfers.
 
 import {
-  isSwMessage, leaveToNetwork, type HelloReply, type LogMsg, type ServeMsg, type ServeReply, type SwRequestReport,
+  isSwMessage, leaveToNetwork, readyTimeoutMs,
+  type HelloReply, type LogMsg, type ServeMsg, type ServeReply, type SwRequestReport,
 } from "./swproto.ts";
 import type { Transport } from "./fetcher.ts";
 
@@ -38,8 +39,6 @@ const sw = self as unknown as SwGlobal;
 
 /** How long a tab has to answer "hello" before it counts as having no bridge. */
 const ACK_TIMEOUT_MS = 500;
-/** How long a request waits for the tab's session to come up before using the network. */
-const READY_TIMEOUT_MS = 2000;
 /** How often a forwarded request checks that its tab still exists. */
 const WATCHDOG_MS = 1000;
 const REPORT_LIMIT = 2000;
@@ -95,8 +94,11 @@ async function serve(req: Request, clientId: string): Promise<Response> {
   const tab = tabs.get(clientId) ?? hello(client);
   if (!tab.info) {
     if (!(await tab.acked)) return network("fallback", "tab has no HTTP4 bridge");
-    const info = await Promise.race([tab.ready, sleep(READY_TIMEOUT_MS).then(() => undefined)]);
-    if (!info) return network("fallback", "tab's HTTP4 session not ready");
+    // How long this is worth waiting depends on what the request is for: a
+    // stylesheet delays first paint, an image delays nothing (readyTimeoutMs).
+    const waitMs = readyTimeoutMs(req.destination);
+    const info = await Promise.race([tab.ready, sleep(waitMs).then(() => undefined)]);
+    if (!info) return network("fallback", `tab's HTTP4 session not ready after ${waitMs} ms`);
   }
   const info = tab.info!;
   if (!info.available) return network("fallback", info.reason ?? "HTTP4 unavailable in tab");

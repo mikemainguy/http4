@@ -5,7 +5,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Http4Fetcher, prefixMapper, type AssetRequester } from "../../client/src/fetcher.ts";
 import { open, resolveWTUrl } from "../../client/src/index.ts";
-import { leaveToNetwork, serveReply, type InterceptInput } from "../../client/src/swproto.ts";
+import {
+  leaveToNetwork, readyTimeoutMs, serveReply,
+  READY_TIMEOUT_MS, READY_TIMEOUT_BLOCKING_MS, READY_TIMEOUT_BULK_MS,
+  type InterceptInput,
+} from "../../client/src/swproto.ts";
 import { Http4Error } from "../../client/src/transport.ts";
 import { ErrorCode } from "../../client/src/wire.ts";
 
@@ -26,6 +30,22 @@ test("the worker forwards same-origin GET/HEAD subresources and leaves everythin
   for (const p of ["/http4/auto.js", "/http4/http4.js", "/http4-sw.js", "/config.json"]) {
     assert.equal(leaveToNetwork(req({ url: ORIGIN + p }), ORIGIN), "HTTP4 bootstrap file", p);
   }
+});
+
+test("how long a request waits for the session depends on what is waiting on it", () => {
+  // Render-blocking: every ms held is a ms of first paint.
+  assert.equal(readyTimeoutMs("style"), READY_TIMEOUT_BLOCKING_MS);
+  assert.equal(readyTimeoutMs("script"), READY_TIMEOUT_BLOCKING_MS);
+  // Bulk: nothing paints sooner for these, and they are what SRPT orders.
+  assert.equal(readyTimeoutMs("image"), READY_TIMEOUT_BULK_MS);
+  assert.equal(readyTimeoutMs("video"), READY_TIMEOUT_BULK_MS);
+  assert.equal(readyTimeoutMs("audio"), READY_TIMEOUT_BULK_MS);
+  // Everything else keeps the old single value, including anything new.
+  for (const d of ["font", "", "manifest", "worker", "embed"]) {
+    assert.equal(readyTimeoutMs(d), READY_TIMEOUT_MS, d);
+  }
+  // The ordering is the actual invariant: bulk waits longest, blocking least.
+  assert.ok(READY_TIMEOUT_BLOCKING_MS < READY_TIMEOUT_MS && READY_TIMEOUT_MS < READY_TIMEOUT_BULK_MS);
 });
 
 test("a reply transfers the body's own buffer and copies a view into a larger one", () => {
