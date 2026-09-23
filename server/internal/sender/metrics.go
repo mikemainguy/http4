@@ -25,6 +25,7 @@ type Metrics struct {
 	SeqResendMisses  atomic.Int64 // sequence numbers asked for that the ring no longer held
 	SeqResendRepeats atomic.Int64 // sequence numbers asked for again after they were already resent
 	// Keeping QUIC's send queue shallow (pacer):
+	SendMicros        atomic.Int64 // total time in SendDatagram, every call, whether or not it waited
 	SendBlocked       atomic.Int64 // sends that waited because QUIC's queue was full
 	SendBlockedMicros atomic.Int64 // how long those waited, in total
 	// Why the send loop had nothing to send. SendIdle counts every wait;
@@ -63,6 +64,7 @@ type Snapshot struct {
 	SeqResends          int64 `json:"seq_resends"`
 	SeqResendMisses     int64 `json:"seq_resend_misses"`
 	SeqResendRepeats    int64 `json:"seq_resend_repeats"`
+	SendMicros          int64 `json:"send_micros"`
 	SendBlocked         int64 `json:"send_blocked"`
 	SendBlockedMicros   int64 `json:"send_blocked_micros"`
 	SendIdle            int64 `json:"send_idle"`
@@ -95,6 +97,7 @@ func (m *Metrics) Snapshot() Snapshot {
 		SeqResends:          m.SeqResends.Load(),
 		SeqResendMisses:     m.SeqResendMisses.Load(),
 		SeqResendRepeats:    m.SeqResendRepeats.Load(),
+		SendMicros:          m.SendMicros.Load(),
 		SendBlocked:         m.SendBlocked.Load(),
 		SendBlockedMicros:   m.SendBlockedMicros.Load(),
 		SendIdle:            m.SendIdle.Load(),

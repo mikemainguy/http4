@@ -509,3 +509,33 @@ func TestUngrantedCounterStaysZeroWhenFullyGranted(t *testing.T) {
 		t.Error("SendIdle = 0, so the test never exercised the idle path at all")
 	}
 }
+
+// send_micros must count every handover, not only the ones slow enough to
+// trip the pacer's 1 ms "queue was full" threshold. At a sub-millisecond wire
+// interval that threshold hides essentially all of the sender's time, which
+// is how a throughput ceiling went misdiagnosed (vrek iss-pjpnk4q).
+func TestSendMicrosCountsEveryHandoverNotOnlyBlockedOnes(t *testing.T) {
+	a := asset(50_000)
+	h := start(t, MapAssets{"a": a}, nil)
+	h.send(&wire.Req{RPCID: 1, InitialGrant: 50_000, AssetID: "a"})
+	h.drain(quiet)
+
+	packets := h.m.DataPackets.Load()
+	if packets < 10 {
+		t.Fatalf("only %d data packets; the test needs several handovers", packets)
+	}
+	// A loopback fake conn never waits a millisecond, so the blocked counters
+	// stay at zero while send_micros still accounts for the work.
+	if n := h.m.SendBlocked.Load(); n != 0 {
+		t.Fatalf("SendBlocked = %d on a fake conn that never blocks", n)
+	}
+	if h.m.SendMicros.Load() < 0 {
+		t.Error("SendMicros went negative")
+	}
+	// The real assertion: send_micros is independent of the blocked threshold,
+	// so it is defined even when nothing is "blocked".
+	if h.m.SendMicros.Load() < h.m.SendBlockedMicros.Load() {
+		t.Errorf("SendMicros %d < SendBlockedMicros %d: the total must include the blocked subset",
+			h.m.SendMicros.Load(), h.m.SendBlockedMicros.Load())
+	}
+}

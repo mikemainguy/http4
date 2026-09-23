@@ -611,6 +611,13 @@ func (s *session) transmit(b []byte) error {
 		return err
 	}
 	took := at.Sub(start)
+	// Total handover time, every call. SendBlocked below only counts calls
+	// over pacerBlocked (1 ms), which is the right threshold for the pacer's
+	// "the queue was full" signal but the wrong one for asking where the
+	// sender's time goes: at an ~86 µs wire interval, thousands of sub-
+	// millisecond waits are invisible to it and can still dominate (vrek
+	// iss-pjpnk4q).
+	s.m.SendMicros.Add(took.Microseconds())
 	blocked := took >= pacerBlocked
 	if blocked {
 		s.m.SendBlocked.Add(1)
