@@ -347,15 +347,39 @@ func (s *session) sendLoop(ctx context.Context) {
 		}
 		s.mu.Lock()
 		w, ok := s.pick()
+		// Distinguish "nothing to do" from "work exists but none of it is
+		// granted". Only the second is the receiver holding the sender up, and
+		// without separating them an idle send loop looks the same either way
+		// (vrek iss-pjpnk4q).
+		starved := !ok && s.starvedLocked()
 		s.mu.Unlock()
 		if !ok {
 			// Out of work: the wire is no longer ours to measure.
 			s.pacer.idle()
+			// Count on entry, not on exit: a sender that starves and stays
+			// starved is precisely the case worth seeing, and it would never
+			// record anything if the counter waited for the wait to end. The
+			// durations can only be added afterwards, so an in-progress wait
+			// shows in the count but not yet in the micros.
+			s.m.SendIdle.Add(1)
+			if starved {
+				s.m.SendUngranted.Add(1)
+			}
+			start := s.now()
+			var swept bool
 			select {
 			case <-ctx.Done():
 				return
 			case <-s.wake:
 			case <-sweep.C:
+				swept = true
+			}
+			took := s.now().Sub(start)
+			s.m.SendIdleMicros.Add(took.Microseconds())
+			if starved {
+				s.m.SendUngrantedMicros.Add(took.Microseconds())
+			}
+			if swept {
 				s.evictIdle()
 			}
 			continue
@@ -447,6 +471,20 @@ func (s *session) chunk(seq bool) int {
 }
 
 // due reports the most urgent kind of packet r has waiting, if any.
+// starvedLocked reports whether some RPC still has bytes to send but none of
+// them granted. That is the receiver's grants holding the sender up, as
+// opposed to the sender simply having nothing to do — the two look identical
+// from an idle send loop, and telling them apart is the point of the
+// SendUngranted counters.
+func (s *session) starvedLocked() bool {
+	for _, r := range s.rpcs {
+		if r.next < r.size && r.next >= r.granted {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *rpc) due() (workKind, bool) {
 	switch {
 	case r.packet0Req > r.metaSent:

@@ -455,3 +455,57 @@ func TestRandomizedGrantDiscipline(t *testing.T) {
 		t.Fatalf("%d grant violations", len(h.violation))
 	}
 }
+
+// The send loop being idle means two very different things: no work at all, or
+// work that the receiver has not granted. Aggregate counters could not tell
+// them apart, which cost several wrong diagnoses of a throughput ceiling
+// (vrek iss-pjpnk4q), so SendUngranted separates them.
+func TestUngrantedCounterSeparatesStarvationFromIdleness(t *testing.T) {
+	a := asset(10_000)
+	h := start(t, MapAssets{"a": a}, nil)
+
+	// A REQ that grants only part of the asset: the rest is sent, then the
+	// sender sits with 8000 bytes left and none of them granted.
+	h.send(&wire.Req{RPCID: 1, InitialGrant: 2000, AssetID: "a"})
+	h.drain(quiet)
+	idle, ungranted := h.m.SendIdle.Load(), h.m.SendUngranted.Load()
+	if ungranted == 0 {
+		t.Fatalf("SendUngranted = 0 with 8000 bytes left ungranted (SendIdle %d)", idle)
+	}
+	if idle < ungranted {
+		t.Errorf("SendIdle %d < SendUngranted %d: the subset must not exceed the whole", idle, ungranted)
+	}
+
+	// Finish the asset. From here there is nothing left to send, so further
+	// idling is ordinary idleness and must NOT be counted as starvation.
+	h.send(&wire.Grant{RPCID: 1, MaxOffset: 10_000})
+	h.drain(quiet)
+	// The duration can only be added once the wait ends, which the GRANT just
+	// did — so it lands here rather than while the sender was still starved.
+	if h.m.SendUngrantedMicros.Load() == 0 {
+		t.Error("SendUngrantedMicros = 0 after a starved wait ended")
+	}
+	after := h.m.SendUngranted.Load()
+	h.drain(quiet) // more idle time, with the asset complete
+	if got := h.m.SendUngranted.Load(); got != after {
+		t.Errorf("SendUngranted rose from %d to %d after the asset completed", after, got)
+	}
+	if h.m.SendIdle.Load() <= idle {
+		t.Error("SendIdle did not rise while the sender sat with nothing to do")
+	}
+}
+
+// A session that is never starved must report none, so a zero reading is
+// meaningful rather than merely untested.
+func TestUngrantedCounterStaysZeroWhenFullyGranted(t *testing.T) {
+	a := asset(10_000)
+	h := start(t, MapAssets{"a": a}, nil)
+	h.send(&wire.Req{RPCID: 1, InitialGrant: 10_000, AssetID: "a"})
+	h.drain(quiet)
+	if n := h.m.SendUngranted.Load(); n != 0 {
+		t.Errorf("SendUngranted = %d for an asset granted in full", n)
+	}
+	if h.m.SendIdle.Load() == 0 {
+		t.Error("SendIdle = 0, so the test never exercised the idle path at all")
+	}
+}

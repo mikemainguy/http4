@@ -27,64 +27,82 @@ type Metrics struct {
 	// Keeping QUIC's send queue shallow (pacer):
 	SendBlocked       atomic.Int64 // sends that waited because QUIC's queue was full
 	SendBlockedMicros atomic.Int64 // how long those waited, in total
-	PacedWaits        atomic.Int64 // times the send loop held off to let the queue drain
-	PacedWaitMicros   atomic.Int64 // total time it held off
-	PacerIntervalUs   atomic.Int64 // last estimated time between departures, 0 while unmeasured
+	// Why the send loop had nothing to send. SendIdle counts every wait;
+	// SendUngranted counts the subset where an RPC still had bytes left but
+	// none of them granted, i.e. the receiver's grants were the hold-up rather
+	// than the sender having no work (vrek iss-pjpnk4q). Blocked and ungranted
+	// are opposite ends: blocked means the wire can't take what we have,
+	// ungranted means we're not allowed to send what the wire would take.
+	SendIdle            atomic.Int64
+	SendIdleMicros      atomic.Int64
+	SendUngranted       atomic.Int64
+	SendUngrantedMicros atomic.Int64
+	PacedWaits          atomic.Int64 // times the send loop held off to let the queue drain
+	PacedWaitMicros     atomic.Int64 // total time it held off
+	PacerIntervalUs     atomic.Int64 // last estimated time between departures, 0 while unmeasured
 }
 
 // Snapshot is Metrics as plain values, for JSON.
 type Snapshot struct {
-	Sessions          int64 `json:"sessions"`
-	RPCs              int64 `json:"rpcs"`
-	PacketsIn         int64 `json:"packets_in"`
-	MalformedIn       int64 `json:"malformed_in"`
-	DataPackets       int64 `json:"data_packets"`
-	DataBytes         int64 `json:"data_bytes"`
-	ResentBytes       int64 `json:"resent_bytes"`
-	ErrorsSent        int64 `json:"errors_sent"`
-	ChunkShrinks      int64 `json:"chunk_shrinks"`
-	RPCsEvicted       int64 `json:"rpcs_evicted"`
-	UngrantedSent     int64 `json:"ungranted_bytes_sent"`
-	DroppedData       int64 `json:"dropped_data_packets"`
-	MetaPackets       int64 `json:"meta_packets"`
-	DroppedMeta       int64 `json:"dropped_meta_packets"`
-	HellosIn          int64 `json:"hellos_in"`
-	DataSeqPackets    int64 `json:"data_seq_packets"`
-	SeqResends        int64 `json:"seq_resends"`
-	SeqResendMisses   int64 `json:"seq_resend_misses"`
-	SeqResendRepeats  int64 `json:"seq_resend_repeats"`
-	SendBlocked       int64 `json:"send_blocked"`
-	SendBlockedMicros int64 `json:"send_blocked_micros"`
-	PacedWaits        int64 `json:"paced_waits"`
-	PacedWaitMicros   int64 `json:"paced_wait_micros"`
-	PacerIntervalUs   int64 `json:"pacer_interval_us"`
+	Sessions            int64 `json:"sessions"`
+	RPCs                int64 `json:"rpcs"`
+	PacketsIn           int64 `json:"packets_in"`
+	MalformedIn         int64 `json:"malformed_in"`
+	DataPackets         int64 `json:"data_packets"`
+	DataBytes           int64 `json:"data_bytes"`
+	ResentBytes         int64 `json:"resent_bytes"`
+	ErrorsSent          int64 `json:"errors_sent"`
+	ChunkShrinks        int64 `json:"chunk_shrinks"`
+	RPCsEvicted         int64 `json:"rpcs_evicted"`
+	UngrantedSent       int64 `json:"ungranted_bytes_sent"`
+	DroppedData         int64 `json:"dropped_data_packets"`
+	MetaPackets         int64 `json:"meta_packets"`
+	DroppedMeta         int64 `json:"dropped_meta_packets"`
+	HellosIn            int64 `json:"hellos_in"`
+	DataSeqPackets      int64 `json:"data_seq_packets"`
+	SeqResends          int64 `json:"seq_resends"`
+	SeqResendMisses     int64 `json:"seq_resend_misses"`
+	SeqResendRepeats    int64 `json:"seq_resend_repeats"`
+	SendBlocked         int64 `json:"send_blocked"`
+	SendBlockedMicros   int64 `json:"send_blocked_micros"`
+	SendIdle            int64 `json:"send_idle"`
+	SendIdleMicros      int64 `json:"send_idle_micros"`
+	SendUngranted       int64 `json:"send_ungranted"`
+	SendUngrantedMicros int64 `json:"send_ungranted_micros"`
+	PacedWaits          int64 `json:"paced_waits"`
+	PacedWaitMicros     int64 `json:"paced_wait_micros"`
+	PacerIntervalUs     int64 `json:"pacer_interval_us"`
 }
 
 func (m *Metrics) Snapshot() Snapshot {
 	return Snapshot{
-		Sessions:          m.Sessions.Load(),
-		RPCs:              m.RPCs.Load(),
-		PacketsIn:         m.PacketsIn.Load(),
-		MalformedIn:       m.MalformedIn.Load(),
-		DataPackets:       m.DataPackets.Load(),
-		DataBytes:         m.DataBytes.Load(),
-		ResentBytes:       m.ResentBytes.Load(),
-		ErrorsSent:        m.ErrorsSent.Load(),
-		ChunkShrinks:      m.ChunkShrinks.Load(),
-		RPCsEvicted:       m.RPCsEvicted.Load(),
-		UngrantedSent:     m.UngrantedSent.Load(),
-		DroppedData:       m.DroppedData.Load(),
-		MetaPackets:       m.MetaPackets.Load(),
-		DroppedMeta:       m.DroppedMeta.Load(),
-		HellosIn:          m.HellosIn.Load(),
-		DataSeqPackets:    m.DataSeqPackets.Load(),
-		SeqResends:        m.SeqResends.Load(),
-		SeqResendMisses:   m.SeqResendMisses.Load(),
-		SeqResendRepeats:  m.SeqResendRepeats.Load(),
-		SendBlocked:       m.SendBlocked.Load(),
-		SendBlockedMicros: m.SendBlockedMicros.Load(),
-		PacedWaits:        m.PacedWaits.Load(),
-		PacedWaitMicros:   m.PacedWaitMicros.Load(),
-		PacerIntervalUs:   m.PacerIntervalUs.Load(),
+		Sessions:            m.Sessions.Load(),
+		RPCs:                m.RPCs.Load(),
+		PacketsIn:           m.PacketsIn.Load(),
+		MalformedIn:         m.MalformedIn.Load(),
+		DataPackets:         m.DataPackets.Load(),
+		DataBytes:           m.DataBytes.Load(),
+		ResentBytes:         m.ResentBytes.Load(),
+		ErrorsSent:          m.ErrorsSent.Load(),
+		ChunkShrinks:        m.ChunkShrinks.Load(),
+		RPCsEvicted:         m.RPCsEvicted.Load(),
+		UngrantedSent:       m.UngrantedSent.Load(),
+		DroppedData:         m.DroppedData.Load(),
+		MetaPackets:         m.MetaPackets.Load(),
+		DroppedMeta:         m.DroppedMeta.Load(),
+		HellosIn:            m.HellosIn.Load(),
+		DataSeqPackets:      m.DataSeqPackets.Load(),
+		SeqResends:          m.SeqResends.Load(),
+		SeqResendMisses:     m.SeqResendMisses.Load(),
+		SeqResendRepeats:    m.SeqResendRepeats.Load(),
+		SendBlocked:         m.SendBlocked.Load(),
+		SendBlockedMicros:   m.SendBlockedMicros.Load(),
+		SendIdle:            m.SendIdle.Load(),
+		SendIdleMicros:      m.SendIdleMicros.Load(),
+		SendUngranted:       m.SendUngranted.Load(),
+		SendUngrantedMicros: m.SendUngrantedMicros.Load(),
+		PacedWaits:          m.PacedWaits.Load(),
+		PacedWaitMicros:     m.PacedWaitMicros.Load(),
+		PacerIntervalUs:     m.PacerIntervalUs.Load(),
 	}
 }
