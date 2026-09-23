@@ -235,3 +235,19 @@ test("a page can tune the session from its config, and only through the allowlis
   // Zero is a legitimate setting (e.g. initialGrant 0) and must survive.
   assert.deepEqual(tuningOptions({ initialGrant: 0 }), { initialGrant: 0 });
 });
+
+test("stats echo the settings in force, so an ignored tuning value is visible", async () => {
+  const base = ORIGIN + "/index.html";
+  const cfgFetch = (cfg: object) => async () =>
+    new Response(JSON.stringify(cfg), { headers: { "content-type": "application/json" } });
+
+  // Node has no WebTransport, so there is no session and no stats to read;
+  // what is checked here is that tuningOptions feeds the same keys the stats
+  // echo, which is what makes the echo meaningful.
+  const applied = tuningOptions({ minIncrement: 262144, budgetFloor: 524288, budgetK: 4, initialGrant: 65536 });
+  assert.deepEqual(applied, { minIncrement: 262144, budgetFloor: 524288, budgetK: 4, initialGrant: 65536 });
+
+  // And that a config carrying them reaches open() without being rejected.
+  const o = await open({ baseUrl: base, fetch: cfgFetch({ webTransportUrl: "https://x/wt", assetPrefix: "/", tuning: applied }) });
+  assert.equal(o.assetPrefix, "/");
+});

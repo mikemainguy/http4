@@ -125,6 +125,13 @@ export interface ClientStats {
    */
   budgetMin: number; // smallest budget seen while a grant was computed (0 = none yet)
   grantsAtFloor: number; // GRANTs issued while the budget was still at its floor
+  /**
+   * The settings actually in force, echoed back. Without this there is no way
+   * to tell a tuning value that was applied from one that was ignored — a
+   * typo, a stale cached page, or a config the client never read all look
+   * identical in the other counters.
+   */
+  settings: { minIncrement: number; budgetFloor: number; budgetCap: number; budgetK: number; initialGrant: number | null };
 }
 
 export class Http4Error extends Error {
@@ -220,6 +227,9 @@ const DEFAULT_BUDGET_FLOOR = 128 * 1024;
 // 16 MiB is about 17k datagrams in Chrome's incoming queue at the worst case of
 // 1007-byte payloads; quic-go's congestion window tops out below that anyway.
 const DEFAULT_BUDGET_CAP = 16 * 1024 * 1024;
+// Mirrors budget.ts's DEFAULT_K, so the echoed settings say what is in force
+// even when the caller passed nothing.
+const DEFAULT_BUDGET_K = 2;
 const MIN_INITIAL_GRANT = 4096; // a 4 KiB API reply completes in one round trip
 const MAX_INITIAL_GRANT = 64 * 1024; // bounds what a burst of REQs pre-authorizes
 const DEFAULT_MIN_INCREMENT = 16 * 1024;
@@ -322,6 +332,13 @@ export class Http4Client {
       metaIn: 0, streamPauses: 0, recoveries: 0, droppedOutgoing: 0, srttMs: null, rtoMs: this.rto(),
       budget: this.budget.budget, bdpBytes: 0, minRttMs: null,
       budgetMin: 0, grantsAtFloor: 0,
+      settings: {
+        minIncrement: opts.minIncrement ?? DEFAULT_MIN_INCREMENT,
+        budgetFloor: opts.budget ?? opts.budgetFloor ?? DEFAULT_BUDGET_FLOOR,
+        budgetCap: opts.budget ?? opts.budgetCap ?? DEFAULT_BUDGET_CAP,
+        budgetK: opts.budgetK ?? DEFAULT_BUDGET_K,
+        initialGrant: opts.initialGrant ?? null,
+      },
     };
     this.stats.reorderWindowMs = this.reorderWindow();
     this.sendHello();
