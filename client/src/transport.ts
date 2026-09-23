@@ -115,6 +115,16 @@ export interface ClientStats {
   budget: number; // current grant budget in bytes
   bdpBytes: number; // estimated bandwidth-delay product (0 before an estimate)
   minRttMs: number | null;
+  /**
+   * The budget while grants were actually being issued, which is what limited
+   * the transfer — `budget` alone is read after the fact and says nothing
+   * about the ramp. A short transfer can spend all of itself climbing from
+   * `budgetFloor`, granting in minIncrement-sized steps and leaving the sender
+   * starved, then finish with a large budget it never got to use (vrek
+   * iss-pjpnk4q).
+   */
+  budgetMin: number; // smallest budget seen while a grant was computed (0 = none yet)
+  grantsAtFloor: number; // GRANTs issued while the budget was still at its floor
 }
 
 export class Http4Error extends Error {
@@ -311,6 +321,7 @@ export class Http4Client {
       hellosSent: 0, seqNegotiated: false, dataSeqIn: 0, seqLost: 0, seqResendsSent: 0,
       metaIn: 0, streamPauses: 0, recoveries: 0, droppedOutgoing: 0, srttMs: null, rtoMs: this.rto(),
       budget: this.budget.budget, bdpBytes: 0, minRttMs: null,
+      budgetMin: 0, grantsAtFloor: 0,
     };
     this.stats.reorderWindowMs = this.reorderWindow();
     this.sendHello();
@@ -567,10 +578,16 @@ export class Http4Client {
   }
 
   private pumpGrants(): void {
-    this.scheduler.setBudget(this.budget.budget);
+    const budget = this.budget.budget;
+    // Sampled here, not after the fact: this is the budget the grants below
+    // are computed from, which is the one that limited the transfer.
+    this.stats.budgetMin = this.stats.budgetMin === 0 ? budget : Math.min(this.stats.budgetMin, budget);
+    const atFloor = budget <= this.budget.floorBytes;
+    this.scheduler.setBudget(budget);
     this.syncQueueLimit();
     for (const g of this.scheduler.grants(this.reserved())) {
       this.stats.grantsSent++;
+      if (atFloor) this.stats.grantsAtFloor++;
       const t = this.transfers.get(g.rpcId);
       if (t) {
         // Keep an older probe: it's still the GRANT that allowed its bytes.

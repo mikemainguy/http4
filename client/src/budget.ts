@@ -72,6 +72,11 @@ export class BudgetController {
   }
 
   /** The budget to use now. */
+  /** The configured lower bound, so callers can tell a ramping budget from a settled one. */
+  get floorBytes(): number {
+    return this.floor;
+  }
+
   get budget(): number {
     return this.current;
   }

@@ -4,7 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Http4Fetcher, prefixMapper, type AssetRequester } from "../../client/src/fetcher.ts";
-import { open, resolveWTUrl } from "../../client/src/index.ts";
+import { open, resolveWTUrl, tuningOptions } from "../../client/src/index.ts";
 import {
   leaveToNetwork, readyTimeoutMs, serveReply,
   READY_TIMEOUT_MS, READY_TIMEOUT_BLOCKING_MS, READY_TIMEOUT_BULK_MS,
@@ -210,4 +210,28 @@ test("outcome() gives HTTP4 bodies, a HEAD without one, an authoritative 404, an
   const broken = await f.outcome(u("/assets/broken"), "GET");
   assert.equal(broken.transport, "fallback");
   assert.deepEqual(await f.outcome(u("/other/x"), "GET"), { transport: "platform", reason: "not an HTTP4 asset path" });
+});
+
+test("a page can tune the session from its config, and only through the allowlist", () => {
+  // Everything a site may set without writing JavaScript.
+  assert.deepEqual(
+    tuningOptions({ budgetFloor: 524288, budgetK: 4, initialGrant: 65536, earlyResend: false, sessionSeq: true }),
+    { budgetFloor: 524288, budgetK: 4, initialGrant: 65536, earlyResend: false, sessionSeq: true },
+  );
+
+  // Config is data, not code: anything unrecognised is dropped rather than
+  // trusted, so a typo costs the setting and not the session.
+  assert.deepEqual(tuningOptions({ nonsense: 1, __proto__: { x: 1 }, trace: [], dropOutgoing: () => true }), {});
+  assert.deepEqual(tuningOptions({ budgetFloor: "512k" }), {}, "wrong type");
+  assert.deepEqual(tuningOptions({ budgetK: -1 }), {}, "negative");
+  assert.deepEqual(tuningOptions({ budgetCap: Number.NaN }), {}, "NaN");
+  assert.deepEqual(tuningOptions({ budgetCap: Number.POSITIVE_INFINITY }), {}, "Infinity");
+  assert.deepEqual(tuningOptions({ earlyResend: "yes" }), {}, "a string is not a boolean");
+
+  // Not an object at all.
+  for (const bad of [null, undefined, 42, "x", [1, 2]]) {
+    assert.deepEqual(tuningOptions(bad), {}, String(bad));
+  }
+  // Zero is a legitimate setting (e.g. initialGrant 0) and must survive.
+  assert.deepEqual(tuningOptions({ initialGrant: 0 }), { initialGrant: 0 });
 });

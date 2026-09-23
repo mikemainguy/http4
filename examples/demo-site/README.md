@@ -42,6 +42,39 @@ Three things to know:
 - **A wrong but *usable* URL is still used, not validated.** `https://typo.example/wt` will be dialled, fail, and
   leave the page fallback-only. Relative URLs avoid this whole class of mistake.
 
+## Tuning, without writing JavaScript
+
+The same inline block can carry session settings, so a site can tune HTTP4 from HTML alone:
+
+```html
+<script type="application/http4-config">
+{"webTransportUrl": "/wt", "assetPrefix": "/",
+ "tuning": {"budgetFloor": 524288, "budgetK": 4, "initialGrant": 65536}}
+</script>
+```
+
+| setting | default | raise it when | lower it when |
+|---|---|---|---|
+| `budgetFloor` | 128 KiB | a short page load spends itself ramping, so transfers never reach full speed | memory per session matters more than peak throughput |
+| `budgetCap` | 16 MiB | a long fat path can hold more in flight | you want a hard ceiling on browser memory |
+| `budgetK` | 2 | you want the budget to reach `k × BDP` faster or sit higher | the extra in-flight data is queueing rather than helping |
+| `initialGrant` | ~1 BDP, 4–64 KiB | most responses are large, so the first round trip should carry more | the site is mostly small API calls and you want them to share the budget |
+| `minIncrement` | 16 KiB | GRANTs are costing more than they are worth | you want the sender fed in finer steps |
+| `rtoFloorMs` | | the path's real RTT is well above the default | |
+| `maxRecoveries` | 10 | a lossy path should keep trying | a failure should surface sooner |
+| `reorderPackets` | 3 | the path reorders heavily and repairs are spurious | | 
+| `streamHighWaterMark` | 1 MiB | readers are slow and you want more buffered | memory is tight |
+| `earlyResend` | true | | measuring what early repair is worth |
+| `sessionSeq` | true | | talking to a server without wire v2 |
+
+The list is an allowlist, and values are type-checked: anything unrecognised, wrongly typed, negative, `NaN` or
+infinite is **ignored**, so a typo costs that setting rather than the session. Options passed in JavaScript always
+win over the config, so a page can override an embedder.
+
+The two worth reaching for first, on the evidence so far: `budgetFloor`, because a short transfer can spend all of
+itself climbing from 128 KiB (vrek `iss-pjpnk4q`), and `initialGrant`, because it decides how much arrives in the
+first round trip before any GRANT.
+
 ## Run it
 
 ```sh

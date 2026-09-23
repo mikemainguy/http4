@@ -97,8 +97,9 @@ export interface Opened {
 export async function open(opts: ConnectOptions = {}): Promise<Opened> {
   const {
     webTransportUrl, certHash, configUrl, assetPrefix, pathToAssetId, baseUrl: base, onRequest, reportLimit, stream,
-    connectTimeoutMs, fetch: fetchOpt, ...clientOpts
+    connectTimeoutMs, fetch: fetchOpt, ...explicitOpts
   } = opts;
+  let clientOpts = explicitOpts;
   const baseUrl = base ?? globalThis.location?.href;
   if (!baseUrl) throw new TypeError("http4.connect: no baseUrl and no location to default it from");
   const platformFetch = fetchOpt ?? globalThis.fetch.bind(globalThis);
@@ -177,6 +178,47 @@ interface ServerConfig {
   webTransportUrl?: string;
   certHash?: string;
   assetPrefix?: string;
+  tuning?: unknown;
+}
+
+/**
+ * Session options a page may set from its config, without writing JavaScript.
+ * Only these, and only numbers and booleans: the config is data, so anything
+ * unrecognised is ignored rather than trusted, and a typo costs the setting
+ * rather than the session.
+ *
+ * The defaults suit a general site. They are worth changing when a site knows
+ * something the client can't measure in time — an app that is mostly small API
+ * calls wants a smaller `initialGrant`, one serving large media over a long
+ * path wants a higher `budgetFloor` so a short transfer isn't spent ramping.
+ */
+const TUNABLE = {
+  budget: "number",
+  budgetFloor: "number",
+  budgetCap: "number",
+  budgetK: "number",
+  minIncrement: "number",
+  initialGrant: "number",
+  rtoFloorMs: "number",
+  maxRecoveries: "number",
+  reorderPackets: "number",
+  streamHighWaterMark: "number",
+  earlyResend: "boolean",
+  sessionSeq: "boolean",
+} as const;
+
+/** The allowlisted, type-checked subset of `raw`. Anything else is dropped. */
+export function tuningOptions(raw: unknown): Partial<ConnectOptions> {
+  if (typeof raw !== "object" || raw === null) return {};
+  const out: Record<string, number | boolean> = {};
+  for (const [key, kind] of Object.entries(TUNABLE)) {
+    const v = (raw as Record<string, unknown>)[key];
+    if (kind === "boolean" && typeof v === "boolean") out[key] = v;
+    // Reject NaN, Infinity and negatives here rather than letting them reach
+    // the budget arithmetic, where they would be much harder to trace back.
+    else if (kind === "number" && typeof v === "number" && Number.isFinite(v) && v >= 0) out[key] = v;
+  }
+  return out as Partial<ConnectOptions>;
 }
 
 /**
@@ -285,7 +327,10 @@ async function openSession(
   }
   if (noWebTransport) throw new Error("WebTransport not supported");
   const bytes = typeof hash === "string" ? Uint8Array.from(atob(hash), (c) => c.charCodeAt(0)) : hash;
-  const pending = Http4Client.connect(url, bytes, clientOpts);
+  // The config's tuning sits UNDER anything the caller passed, so code always
+  // wins over the page's data and a site can't override an embedder.
+  const tuned: ClientOptions = { ...tuningOptions(cfgOut.tuning), ...clientOpts };
+  const pending = Http4Client.connect(url, bytes, tuned);
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new Error(`WebTransport connect timed out after ${timeoutMs} ms`)), timeoutMs);
