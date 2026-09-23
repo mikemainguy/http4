@@ -107,7 +107,8 @@ export class SrptScheduler {
    * of REQs whose size isn't known yet.
    */
   grants(reserved = 0): GrantDecision[] {
-    let available = this.budget - reserved - this.outstanding();
+    const outstanding = this.outstanding();
+    let available = this.budget - reserved - outstanding;
     const candidates = [...this.rpcs.entries()]
       .filter(([, e]) => e.granted < e.size && !e.paused)
       .sort(([, a], [, b]) => a.size - a.received - (b.size - b.received) || a.seq - b.seq);
@@ -120,8 +121,14 @@ export class SrptScheduler {
       const target = Math.min(e.size, e.granted + available);
       const inc = target - e.granted;
       // Strict SRPT: if the shortest RPC can't take a worthwhile grant yet,
-      // nobody longer gets one either.
-      if (inc < this.opts.minIncrement && target < e.size) {
+      // nobody longer gets one either — unless nothing is in flight at all,
+      // in which case a small grant is the only thing that can restart the
+      // session. Without that exception a minIncrement larger than the budget
+      // can ever free deadlocks every transfer bigger than it: no grant is
+      // issued, so no data arrives, so the budget never grows, so no grant is
+      // issued (vrek iss-pjpnk4q; it wedged a live site).
+      const stalled = outstanding === 0 && out.length === 0;
+      if (inc < this.opts.minIncrement && target < e.size && !stalled) {
         this.limited = true;
         break;
       }

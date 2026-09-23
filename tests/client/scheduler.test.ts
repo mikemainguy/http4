@@ -160,3 +160,45 @@ test("randomized: SRPT invariants hold across many interleaved transfers", () =>
   assert.ok(totalGrants > 1000 && contendedGrants > 500, `grants ${totalGrants}, contended ${contendedGrants}`);
   console.log(`scheduler simulation: ${totalGrants} grants, ${contendedGrants} under contention`);
 });
+
+// A minIncrement larger than the budget can ever free used to deadlock: no
+// grant was worth issuing, so no data arrived, so the budget never grew, so no
+// grant was issued. Suggested as a tuning value, it wedged a live site (vrek
+// iss-pjpnk4q). Whatever the settings, a session with nothing in flight must
+// always be able to make progress.
+test("a minIncrement larger than the budget still makes progress", () => {
+  const s = new SrptScheduler({ budget: 128 * 1024, minIncrement: 256 * 1024 });
+  s.add(1n, 5_000_000, 0, 0); // far larger than the budget
+
+  let granted = 0;
+  let received = 0;
+  for (let round = 0; round < 200 && received < 5_000_000; round++) {
+    const gs = s.grants(0);
+    if (gs.length === 0) {
+      assert.fail(`no grant issued at round ${round} with ${received} of 5000000 received: deadlocked`);
+    }
+    for (const g of gs) {
+      assert.ok(g.maxOffset > granted, "a grant must advance the ceiling");
+      const fresh = g.maxOffset - granted;
+      granted = g.maxOffset;
+      received += fresh;
+      s.onData(g.rpcId, fresh);
+    }
+  }
+  assert.equal(received, 5_000_000, "the transfer must complete despite the oversized minIncrement");
+});
+
+test("the progress exception does not weaken strict SRPT while data is in flight", () => {
+  const s = new SrptScheduler({ budget: 100_000, minIncrement: 16_384 });
+  s.add(1n, 1_000_000, 0, 0);
+  s.add(2n, 2_000_000, 0, 0);
+  // First round: the budget is spent on the shortest, as SRPT requires.
+  const first = s.grants(0);
+  assert.equal(first.length, 1);
+  assert.equal(first[0]!.rpcId, 1n);
+  // With bytes outstanding and less than minIncrement free, nobody gets a
+  // dribble — the exception must not fire here.
+  assert.deepEqual(s.grants(0), []);
+  s.onData(1n, 1000); // frees only 1000 bytes, under minIncrement
+  assert.deepEqual(s.grants(0), [], "a sub-minIncrement top-up is still withheld while data is in flight");
+});
