@@ -31,3 +31,7 @@ spikes/*/www/sw.js
 
 # DevTools traces: large, machine-specific captures kept out of the repo
 performance_recordings/
+
+# deployment tarballs built into the working tree
+http4-demo.tar.gz
+http4-vm.tar.gz
