@@ -69,6 +69,16 @@ type Config struct {
 	ClientFS fs.FS
 	// NoH3 turns off the plain-HTTP/3 baseline route (H3Path).
 	NoH3 bool
+	// AltSvc advertises HTTP/3 on the UDP port with an Alt-Svc header, so a
+	// browser upgrades this origin to HTTP/3 on its own. It is off by default
+	// and deliberately so: Alt-Svc applies to the WHOLE origin, so turning it
+	// on silently moves the plain-HTTP comparison from HTTP/2 to HTTP/3, and a
+	// run measured against one baseline cannot be compared with the other
+	// (vrek fnd-9s48fb0 and fnd-f9mjfas were both measured against HTTP/2).
+	// Turn it on to compare against HTTP/3, and say which baseline a result
+	// used. Needs a CA-trusted certificate: a browser will not upgrade to an
+	// origin whose certificate it does not already trust.
+	AltSvc bool
 
 	// Cert says where the TLS certificate comes from. The zero value is the
 	// dev certificate: self-signed, pinned by hash, localhost only.
@@ -254,7 +264,13 @@ func Start(cfg Config) (*Server, error) {
 		httpMux.Handle(assetPrefix, http.StripPrefix(assetPrefix, http.HandlerFunc(s.handleAsset)))
 		httpMux.Handle("/", http.FileServer(http.Dir(cfg.StaticDir)))
 	}
-	s.httpSrv = &http.Server{Handler: httpMux, ReadHeaderTimeout: 5 * time.Second}
+	var handler http.Handler = httpMux
+	if cfg.AltSvc {
+		if alt := altSvcValue(s.WebTransportURL, udpConn.LocalAddr().String()); alt != "" {
+			handler = withAltSvc(handler, alt)
+		}
+	}
+	s.httpSrv = &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 
 	if cert.Trusted() {
 		// ServeTLS rather than a wrapped listener, so Go sets up HTTP/2 too.
@@ -330,6 +346,49 @@ func (s *Server) ClientConfig() ClientConfig {
 		SPKIHash:        s.cert.SPKIHash(),
 		AssetPrefix:     s.assetPrefix,
 	}
+}
+
+// altSvcMaxAge is how long a browser may remember the advertisement. A day is
+// the usual choice: long enough to be useful, short enough that moving the
+// service doesn't strand clients on a port that stopped answering.
+const altSvcMaxAge = 86400
+
+// altSvcValue builds the Alt-Svc header advertising HTTP/3 on the UDP port,
+// preferring the advertised WebTransport host (what clients can actually
+// reach) over the listener's own address. It returns "" when no usable port
+// can be determined, so a wildcard or unparseable address advertises nothing
+// rather than something wrong — pointing a browser at a port that does not
+// answer would make it retry HTTP/3 and fall back on every request.
+//
+// Only the port is advertised, not the host: RFC 7838 lets ":443" mean "the
+// same host, this port", which stays correct however the client reached us.
+func altSvcValue(webTransportURL, listenAddr string) string {
+	port := ""
+	if u, err := url.Parse(webTransportURL); err == nil {
+		port = u.Port()
+		if port == "" && u.Scheme == "https" {
+			port = "443"
+		}
+	}
+	if port == "" {
+		if _, p, err := net.SplitHostPort(listenAddr); err == nil {
+			port = p
+		}
+	}
+	if port == "" || port == "0" {
+		return ""
+	}
+	return fmt.Sprintf(`h3=":%s"; ma=%d`, port, altSvcMaxAge)
+}
+
+// withAltSvc adds the advertisement to every response from the TCP listener.
+// It is set before the handler runs, so a handler that writes its own headers
+// doesn't lose it.
+func withAltSvc(next http.Handler, value string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Alt-Svc", value)
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) h3URL() string {
