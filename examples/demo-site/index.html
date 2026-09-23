@@ -2,6 +2,12 @@
 <html lang="en">
 <head>
   <!-- The only HTTP4 line: one classic script, first in <head>. -->
+  <!-- Optional: saves the /config.json round trip that would otherwise wait
+       for auto.js to load. "/wt" resolves against whatever host serves this
+       page, so the same line is right on any deployment; a dev server serving
+       over plain HTTP can't resolve it to https, so it is ignored there and
+       /config.json answers as usual. -->
+  <script type="application/http4-config">{"webTransportUrl": "/wt", "assetPrefix": "/"}</script>
   <script src="/http4/auto.js"></script>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">

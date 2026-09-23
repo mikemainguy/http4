@@ -4,7 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Http4Fetcher, prefixMapper, type AssetRequester } from "../../client/src/fetcher.ts";
-import { open } from "../../client/src/index.ts";
+import { open, resolveWTUrl } from "../../client/src/index.ts";
 import { leaveToNetwork, serveReply, type InterceptInput } from "../../client/src/swproto.ts";
 import { Http4Error } from "../../client/src/transport.ts";
 import { ErrorCode } from "../../client/src/wire.ts";
@@ -112,9 +112,19 @@ test("an inline config is used instead of fetching /config.json, and a bad one f
     assert.equal(o.assetPrefix, "/", "and its assetPrefix is the one in effect");
   });
 
-  // Malformed, empty, and absent-webTransportUrl blocks are ignored rather
-  // than fatal: they cost a round trip, not the session.
-  for (const bad of ["{not json", "", "   ", "{}", '{"assetPrefix":"/"}', "[1,2]"]) {
+  // A relative URL resolves against the page, so one block works on any host.
+  await withInline('{"webTransportUrl":"/wt","assetPrefix":"/"}', async () => {
+    fetched = 0;
+    await open({ baseUrl: "https://elsewhere.example/index.html", fetch: countingFetch({ webTransportUrl: "https://fetched/wt" }) });
+    assert.equal(fetched, 0, "a relative inline URL is usable, so no round trip");
+  });
+
+  // Malformed, empty, absent-webTransportUrl, and unusable-URL blocks are all
+  // ignored rather than fatal: they cost a round trip, not the session. The
+  // last two matter for a page shipping a relative "/wt" that a development
+  // server serves over plain HTTP, where it can never resolve to https.
+  for (const bad of ["{not json", "", "   ", "{}", '{"assetPrefix":"/"}', "[1,2]",
+                     '{"webTransportUrl":"/wt"}', '{"webTransportUrl":"http://x/wt"}', '{"webTransportUrl":"::::"}']) {
     await withInline(bad, async () => {
       fetched = 0;
       const o = await open({ baseUrl: base, fetch: countingFetch({ webTransportUrl: "https://fetched/wt", assetPrefix: "/" }) });
@@ -128,6 +138,26 @@ test("an inline config is used instead of fetching /config.json, and a bad one f
   const o = await open({ baseUrl: base, fetch: countingFetch({ webTransportUrl: "https://fetched/wt", assetPrefix: "/" }) });
   assert.equal(fetched, 1);
   assert.equal(o.assetPrefix, "/");
+});
+
+test("a relative webTransportUrl resolves against the page, so one config works on any host", () => {
+  const page = "https://a.example/deep/index.html";
+  // The point of allowing a relative URL: the same config is correct on
+  // whatever host serves it, instead of being pinned to one deployment.
+  assert.equal(resolveWTUrl("/wt", page), "https://a.example/wt");
+  assert.equal(resolveWTUrl("wt", page), "https://a.example/deep/wt");
+  assert.equal(resolveWTUrl("//b.example:8443/wt", page), "https://b.example:8443/wt");
+  assert.equal(resolveWTUrl("https://b.example/wt", page), "https://b.example/wt", "absolute still wins");
+  assert.equal(resolveWTUrl("/wt", "https://a.example:8443/index.html"), "https://a.example:8443/wt", "a non-default port carries over");
+
+  // WebTransport requires https, so saying so here beats the opaque
+  // SyntaxError its constructor would throw later.
+  assert.throws(() => resolveWTUrl("http://b.example/wt", page), /is not https/);
+  assert.throws(() => resolveWTUrl("ws://b.example/wt", page), /is not https/);
+  // A page served over plain HTTP (the dev server) must not silently resolve a
+  // relative URL to an http:// one that can never connect.
+  assert.throws(() => resolveWTUrl("/wt", "http://127.0.0.1:8080/index.html"), /is not https/);
+  assert.throws(() => resolveWTUrl("", "not a url"), /is not a URL/);
 });
 
 test("outcome() gives HTTP4 bodies, a HEAD without one, an authoritative 404, and fallback reasons", async () => {

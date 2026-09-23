@@ -7,6 +7,8 @@ is ordinary HTML, CSS and JavaScript. Its only HTTP4 addition is one line, first
 <script src="/http4/auto.js"></script>
 ```
 
+It also carries an optional second line that saves a round trip on slow links — see below.
+
 `http4d serve` does the rest: it serves the pages, serves the same files over HTTP4, and ships the client and
 Service Worker at `/http4/` and `/http4-sw.js`.
 
@@ -18,28 +20,27 @@ between carrying a page's resources and carrying none of them: measured over a t
 up **~8.4 s** in, while the browser had dispatched every image at **3.1 s**, so all of them fell back to plain
 HTTP and **0%** of the page's bytes went over HTTP4 (vrek `fnd-sgw2sbh`).
 
-A page can remove that round trip by carrying the same JSON inline, before the script tag:
+This page removes that round trip by carrying the same JSON inline, before the script tag:
 
 ```html
-<script type="application/http4-config">
-{"webTransportUrl": "https://example.com:443/wt", "assetPrefix": "/"}
-</script>
+<script type="application/http4-config">{"webTransportUrl": "/wt", "assetPrefix": "/"}</script>
 <script src="/http4/auto.js"></script>
 ```
 
-The values are exactly what `/config.json` serves — check with `curl -s https://example.com/config.json`, and
-use `assetPrefix` `"/"` for `http4d serve`.
+**A relative URL is the point.** `/wt` resolves against whatever host serves the page, so one line is correct on
+every deployment with nothing to keep in sync. Use `assetPrefix` `"/"` for `http4d serve`.
 
-Three things to know before using it:
+Three things to know:
 
-- **It must match the server.** A `webTransportUrl` that is present but wrong is *used*, not validated: the
-  session fails to connect and the page runs fallback-only. It does not quietly re-read `/config.json`. If you
-  change `-advertise-wt`, change this too.
-- **It is for a trusted certificate only.** The dev certificate's `certHash` changes every run, so a
-  development server must keep using `/config.json`. This is why the demo site above does not ship an inline
-  block — it would pin the demo to one deployment and break `bin/http4d serve` locally.
-- **A malformed block is harmless.** Invalid JSON, an empty block, or one without `webTransportUrl` is ignored
-  and `/config.json` is fetched as before. It costs the round trip back, not the session.
+- **Relative means same port.** `/wt` inherits the page's host *and port*, which is right when the server runs
+  `-http :443 -wt :443`. If WebTransport is on its own port, write `//host:4433/wt` or the full URL, and then it
+  is pinned to that host again.
+- **An unusable block is ignored, not fatal.** Invalid JSON, a missing `webTransportUrl`, a non-https URL, or a
+  relative one on a page served over plain HTTP all fall back to fetching `/config.json`. That is exactly what
+  happens with `bin/http4d serve` locally, where the dev certificate means the page is plain HTTP — so this line
+  costs nothing there and helps in production.
+- **A wrong but *usable* URL is still used, not validated.** `https://typo.example/wt` will be dialled, fail, and
+  leave the page fallback-only. Relative URLs avoid this whole class of mistake.
 
 ## Run it
 

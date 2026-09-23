@@ -108,7 +108,7 @@ export async function open(opts: ConnectOptions = {}): Promise<Opened> {
   const cfg: ServerConfig = {};
   try {
     client = await openSession(
-      webTransportUrl, certHash, new URL(configUrl ?? DEFAULT_CONFIG_URL, baseUrl).href,
+      webTransportUrl, certHash, new URL(configUrl ?? DEFAULT_CONFIG_URL, baseUrl).href, baseUrl,
       platformFetch, clientOpts, connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS, cfg,
     );
   } catch (e) {
@@ -209,10 +209,31 @@ function inlineConfig(): ServerConfig | undefined {
   }
 }
 
+/**
+ * Absolute https URL for a config's webTransportUrl. WebTransport parses its
+ * argument with no base, so a relative URL throws there; resolving it against
+ * the page lets a config say "/wt" and stay correct on whatever host serves
+ * it. A non-https result is reported here rather than as WebTransport's own
+ * opaque SyntaxError.
+ */
+export function resolveWTUrl(raw: string, baseUrl: string): string {
+  let u: URL;
+  try {
+    u = new URL(raw, baseUrl);
+  } catch {
+    throw new Error(`webTransportUrl ${JSON.stringify(raw)} is not a URL`);
+  }
+  if (u.protocol !== "https:") {
+    throw new Error(`webTransportUrl ${u.href} is not https (WebTransport requires it)`);
+  }
+  return u.href;
+}
+
 async function openSession(
   url: string | undefined,
   hash: Uint8Array<ArrayBuffer> | string | undefined,
   configUrl: string,
+  baseUrl: string,
   platformFetch: typeof fetch,
   clientOpts: ClientOptions,
   timeoutMs: number,
@@ -222,9 +243,23 @@ async function openSession(
   if (url === undefined) {
     // An inline config is already in the parsed HTML, so it saves the round
     // trip /config.json would cost before the session can even be attempted.
+    // An unusable one (not a URL, or not https — e.g. a relative URL on a page
+    // the dev server serves over plain HTTP) is discarded rather than fatal,
+    // so it costs that round trip back and not the session. That is what lets
+    // a page ship a relative "/wt" that is right in production and simply
+    // ignored against a development server.
     const inline = inlineConfig();
-    if (inline?.webTransportUrl) {
-      Object.assign(cfgOut, inline);
+    const inlineUrl = inline?.webTransportUrl;
+    let usable: string | undefined;
+    if (inlineUrl !== undefined) {
+      try {
+        usable = resolveWTUrl(inlineUrl, baseUrl);
+      } catch {
+        usable = undefined;
+      }
+    }
+    if (usable !== undefined) {
+      Object.assign(cfgOut, inline, { webTransportUrl: usable });
     } else {
       // Read the config even without WebTransport, because its assetPrefix
       // decides which requests count as HTTP4-eligible fallbacks. Then a
@@ -239,7 +274,11 @@ async function openSession(
     }
     if (noWebTransport) throw new Error("WebTransport not supported");
     if (!cfgOut.webTransportUrl) throw new Error(`config ${configUrl}: no webTransportUrl`);
-    url = cfgOut.webTransportUrl;
+    // WebTransport itself rejects a relative URL (it parses with no base) and
+    // anything but https. Resolving here lets a config say "/wt" and stay
+    // correct on whatever host serves the page, which is what makes an inline
+    // block portable instead of pinned to one deployment.
+    url = resolveWTUrl(cfgOut.webTransportUrl, baseUrl);
     // An absent or empty certHash means a normally-trusted certificate: open
     // the session without serverCertificateHashes and let the browser verify.
     hash ??= cfgOut.certHash || undefined;
