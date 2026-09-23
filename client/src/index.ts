@@ -9,11 +9,14 @@
 // the platform fetch instead, and report() says so.
 
 import { Http4Fetcher, prefixMapper, type RequestReport } from "./fetcher.ts";
+import { classMap, type ClassMap } from "./priority.ts";
 import { Http4Client, type ClientOptions } from "./transport.ts";
 
 export { Http4Client, Http4Error, httpStatusFor } from "./transport.ts";
 export type { ClientOptions, ClientStats, Http4Response } from "./transport.ts";
 export { prefixMapper } from "./fetcher.ts";
+export { classFor, classForDestination, classMap, CLASSES } from "./priority.ts";
+export type { ClassMap, PriorityClass } from "./priority.ts";
 export type { RequestReport, Transport } from "./fetcher.ts";
 export { install } from "./page.ts";
 export type { Http4Page, InstallOptions, PageRequestReport } from "./page.ts";
@@ -117,7 +120,7 @@ export async function open(opts: ConnectOptions = {}): Promise<Opened> {
   }
 
   const prefix = pathToAssetId ? undefined : (assetPrefix ?? cfg.assetPrefix ?? DEFAULT_ASSET_PREFIX);
-  return build(client, reason, prefix, { baseUrl, pathToAssetId, platformFetch, onRequest, reportLimit, stream });
+  return build(client, reason, prefix, { baseUrl, pathToAssetId, platformFetch, onRequest, reportLimit, stream, classes: classMap(cfg.classes) });
 }
 
 /**
@@ -148,6 +151,7 @@ function build(
     onRequest: ((r: RequestReport) => void) | undefined;
     reportLimit: number | undefined;
     stream: boolean | undefined;
+    classes?: ClassMap;
   },
 ): Opened {
   const fetcher = new Http4Fetcher(client ?? null, reason, {
@@ -157,6 +161,7 @@ function build(
     ...(o.onRequest ? { onRequest: o.onRequest } : {}),
     ...(o.reportLimit !== undefined ? { reportLimit: o.reportLimit } : {}),
     ...(o.stream !== undefined ? { stream: o.stream } : {}),
+    ...(o.classes?.length ? { classes: o.classes } : {}),
   });
   const handle: Http4 = {
     fetch: (input, init) => fetcher.fetch(input, init),
@@ -179,6 +184,7 @@ interface ServerConfig {
   certHash?: string;
   assetPrefix?: string;
   tuning?: unknown;
+  classes?: unknown;
 }
 
 /**

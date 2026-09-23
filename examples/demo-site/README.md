@@ -75,6 +75,41 @@ The two worth reaching for first, on the evidence so far: `budgetFloor`, because
 itself climbing from 128 KiB (vrek `iss-pjpnk4q`), and `initialGrant`, because it decides how much arrives in the
 first round trip before any GRANT.
 
+## Priority classes
+
+By default the client schedules shortest-remaining-first, which is a guess about *size*, not importance: a 400 KB
+critical bundle loses to a 4 KB tracking pixel. Classes let the page say which matters. There are three —
+`critical`, `normal`, `background` — and shortest-first still applies *within* each one.
+
+**Level 0 — nothing to write.** Every request gets a class from its `destination`:
+
+| destination | class | why |
+|---|---|---|
+| `style`, `script`, `font` | critical | the page cannot paint without them |
+| `image`, `video`, `audio` | background | nothing waits on them to become interactive |
+| everything else, including `fetch`/XHR | normal | the app is running and can say better |
+
+**Level 2 — a `classes` map in the config block**, when the defaults are wrong for your site:
+
+```html
+<script type="application/http4-config">
+{"webTransportUrl": "/wt", "assetPrefix": "/",
+ "classes": {"/api/": "critical", "/images/hero": "critical", "/images/": "background"}}
+</script>
+```
+
+Longest matching prefix wins, so `/images/hero` beats `/images/` whatever order you write them in. Anything that
+isn't a `/`-prefixed key mapped to one of the three class names is **ignored**, so a typo costs that rule and not
+the session.
+
+Two things worth knowing:
+
+- **A background transfer is deferred, not starved.** It gets nothing while critical work wants the whole budget,
+  and its turn comes when that work finishes.
+- **This changes which resource finishes when, never when the page finishes.** Under a saturated link the last byte
+  lands at total bytes ÷ throughput whatever the order (vrek `fnd-m1r3sdp`). Classes decide who waits, not how long
+  everyone waits in total.
+
 ## Run it
 
 ```sh

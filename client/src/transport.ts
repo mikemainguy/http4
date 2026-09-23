@@ -36,6 +36,7 @@
 
 import { BudgetController } from "./budget.ts";
 import { Reassembly, RepairTracker, SeqTracker, type SeqHint } from "./reassembly.ts";
+import { DEFAULT_CLASS, type PriorityClass } from "./priority.ts";
 import { SrptScheduler, type GrantTrace } from "./scheduler.ts";
 import { decode, encode, maxPayload, newRpcId, Capability, ErrorCode, MalformedPacketError, type Data, type Packet } from "./wire.ts";
 
@@ -196,6 +197,7 @@ interface StreamState {
 interface Transfer {
   rpcId: bigint;
   assetId: string;
+  cls: PriorityClass; // scheduling class; SRPT applies within one, not across
   initialGrant: number;
   asm?: Reassembly; // set once the first DATA reveals the size
   repair?: RepairTracker; // set with asm
@@ -367,8 +369,8 @@ export class Http4Client {
   }
 
   /** Fetch one asset by ID. Resolves with its bytes and metadata, once it is all there. */
-  request(assetId: string): Promise<Http4Response> {
-    return this.start(assetId, false) as Promise<Http4Response>;
+  request(assetId: string, cls: PriorityClass = DEFAULT_CLASS): Promise<Http4Response> {
+    return this.start(assetId, false, cls) as Promise<Http4Response>;
   }
 
   /**
@@ -382,11 +384,11 @@ export class Http4Client {
    * body never ends cleanly. A reader that falls `streamHighWaterMark` bytes
    * behind stops the transfer being granted until it catches up.
    */
-  requestStream(assetId: string): Promise<Http4Stream> {
-    return this.start(assetId, true) as Promise<Http4Stream>;
+  requestStream(assetId: string, cls: PriorityClass = DEFAULT_CLASS): Promise<Http4Stream> {
+    return this.start(assetId, true, cls) as Promise<Http4Stream>;
   }
 
-  private start(assetId: string, streaming: boolean): Promise<Http4Response | Http4Stream> {
+  private start(assetId: string, streaming: boolean, cls: PriorityClass = DEFAULT_CLASS): Promise<Http4Response | Http4Stream> {
     if (!this.isOpen) return Promise.reject(new Http4Error(this.closed ? "client closed" : "session closed"));
     const rpcId = newRpcId();
     const initialGrant = this.nextInitialGrant();
@@ -398,7 +400,7 @@ export class Http4Client {
     return new Promise((resolve, reject) => {
       const now = performance.now();
       const t: Transfer = {
-        rpcId, assetId, initialGrant, replied: false, settled: false, resolve, reject, lastDetect: -Infinity, tailProbed: false,
+        rpcId, assetId, cls, initialGrant, replied: false, settled: false, resolve, reject, lastDetect: -Infinity, tailProbed: false,
         reqSentAt: now, reqRetransmitted: false, baseRto: this.rto(), ceiling: initialGrant, lastProgress: now, recoveries: 0,
       };
       if (streaming) t.stream = this.makeStream(t);
@@ -551,7 +553,7 @@ export class Http4Client {
         if (!t.asm) {
           t.asm = new Reassembly(p.totalSize);
           t.repair = new RepairTracker();
-          this.scheduler.add(t.rpcId, p.totalSize, t.initialGrant, 0);
+          this.scheduler.add(t.rpcId, p.totalSize, t.initialGrant, 0, t.cls);
         } else if (p.totalSize !== t.asm.size) {
           return this.finish(t, new Http4Error(`total_size changed from ${t.asm.size} to ${p.totalSize}`));
         }

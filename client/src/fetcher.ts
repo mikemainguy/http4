@@ -3,6 +3,7 @@
 // back to the platform fetch otherwise, and records which transport served
 // each request. No I/O of its own, so it can be tested with fakes.
 
+import { classFor, type ClassMap, type PriorityClass } from "./priority.ts";
 import { Http4Error, httpStatusFor, type Http4Response, type Http4Stream } from "./transport.ts";
 import { ErrorCode } from "./wire.ts";
 
@@ -37,9 +38,9 @@ export interface RequestReport {
 /** What the fetcher needs from an HTTP4 session. Http4Client provides it. */
 export interface AssetRequester {
   readonly isOpen: boolean;
-  request(assetId: string): Promise<Http4Response>;
+  request(assetId: string, cls?: PriorityClass): Promise<Http4Response>;
   /** Resolves once the metadata is in, with the body still arriving. */
-  requestStream?(assetId: string): Promise<Http4Stream>;
+  requestStream?(assetId: string, cls?: PriorityClass): Promise<Http4Stream>;
 }
 
 export interface FetcherOptions {
@@ -57,6 +58,12 @@ export interface FetcherOptions {
    * the session supports it). Off: the Response carries the whole body.
    */
   stream?: boolean;
+  /**
+   * Path prefix → scheduling class, from the page's config (vrek
+   * iss-j9tm9w8, Level 2). Empty: the class comes from the request's
+   * destination alone (Level 0).
+   */
+  classes?: ClassMap;
 }
 
 /**
@@ -188,7 +195,7 @@ export class Http4Fetcher {
    * Service Worker bridge uses this and does its own fallback and reporting.
    * The caller has already checked method, origin, body and Range.
    */
-  async outcome(url: URL, method: string, signal?: AbortSignal): Promise<Http4Outcome> {
+  async outcome(url: URL, method: string, signal?: AbortSignal, destination = ""): Promise<Http4Outcome> {
     const assetId = this.opts.pathToAssetId(url);
     if (assetId === null) return { transport: "platform", reason: "not an HTTP4 asset path" };
     if (!this.session?.isOpen) return { transport: "fallback", reason: this.unavailableReason ?? "HTTP4 unavailable" };
@@ -196,12 +203,13 @@ export class Http4Fetcher {
     signal?.throwIfAborted();
     // A HEAD has no body to stream, and a buffered caller wants the bytes.
     const streaming = (this.opts.stream ?? true) && method !== "HEAD" && this.session.requestStream !== undefined;
+    const cls = classFor(url.pathname, destination, this.opts.classes ?? []);
     try {
       if (streaming) {
-        const s = await abortable(this.session.requestStream!(assetId), signal);
+        const s = await abortable(this.session.requestStream!(assetId, cls), signal);
         return { transport: "http4", status: 200, headers: metaHeaders(s.headers, s.size), body: null, stream: s.body, length: s.size };
       }
-      const r = await abortable(this.session.request(assetId), signal);
+      const r = await abortable(this.session.request(assetId, cls), signal);
       return { transport: "http4", status: 200, headers: headersFor(r), body: method === "HEAD" ? null : r.body };
     } catch (e) {
       if (signal?.aborted && e === signal.reason) throw e;

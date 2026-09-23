@@ -126,7 +126,7 @@ function answer(e: MessageEvent, opened: Promise<Opened>): void {
     }
     case "serve":
       void opened
-        .then((o) => o.fetcher.outcome(new URL(m.url), m.method))
+        .then((o) => o.fetcher.outcome(new URL(m.url), m.method, undefined, m.destination))
         .then(
           (o) => {
             const { reply, transfer } = serveReply(o);

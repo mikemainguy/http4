@@ -1,3 +1,4 @@
+import { classRank, DEFAULT_CLASS, type PriorityClass } from "./priority.ts";
 // Receiver-driven SRPT grant scheduler (docs/wire-format.md, GRANT).
 //
 // The client keeps at most `budget` bytes granted but not yet received,
@@ -42,6 +43,7 @@ interface Entry {
   received: number;
   paused?: boolean; // a streaming consumer is behind: no new grants for now
   seq: number; // arrival order, breaks ties
+  cls: PriorityClass; // scheduled class; SRPT applies within one, not across
 }
 
 export class SrptScheduler {
@@ -70,8 +72,8 @@ export class SrptScheduler {
   }
 
   /** Start scheduling an RPC once its size is known. `granted` is what the REQ already allowed. */
-  add(rpcId: bigint, size: number, granted: number, received: number): void {
-    this.rpcs.set(rpcId, { size, granted: Math.min(granted, size), received, seq: this.seq++ });
+  add(rpcId: bigint, size: number, granted: number, received: number, cls: PriorityClass = DEFAULT_CLASS): void {
+    this.rpcs.set(rpcId, { size, granted: Math.min(granted, size), received, seq: this.seq++, cls });
   }
 
   remove(rpcId: bigint): void {
@@ -126,7 +128,12 @@ export class SrptScheduler {
     const minIncrement = Math.min(this.opts.minIncrement, Math.max(1, Math.floor(this.budget / MIN_INCREMENT_BUDGET_SHARE)));
     const candidates = [...this.rpcs.entries()]
       .filter(([, e]) => e.granted < e.size && !e.paused)
-      .sort(([, a], [, b]) => a.size - a.received - (b.size - b.received) || a.seq - b.seq);
+      // Class first, then shortest remaining inside it, then arrival order.
+      // With one class this is exactly the SRPT ordering it replaces.
+      .sort(([, a], [, b]) =>
+        classRank(a.cls) - classRank(b.cls) ||
+        a.size - a.received - (b.size - b.received) ||
+        a.seq - b.seq);
     this.limited = candidates.length > 0 && available < minIncrement;
     if (available <= 0) return [];
 
@@ -147,6 +154,10 @@ export class SrptScheduler {
         this.limited = true;
         break;
       }
+      // The priority byte still carries this round's candidate position. It
+      // should carry the class instead, but the server ignores the byte today
+      // (vrek iss-na6r91e), so changing its meaning before a consumer exists
+      // would be a wire change nothing reads.
       const d: GrantDecision = { rpcId, maxOffset: target, priority: Math.min(rank, 7) };
       if (this.opts.trace) {
         this.opts.trace.push({

@@ -34,6 +34,12 @@ export interface ServeMsg {
   http4: "serve";
   url: string;
   method: "GET" | "HEAD";
+  /**
+   * Request.destination ("style", "script", "image", "" for fetch/XHR, …).
+   * The worker knows it and the page does not, so it has to travel with the
+   * request for the page to classify it (vrek iss-j9tm9w8).
+   */
+  destination?: string;
 }
 
 export interface ReportMsg {

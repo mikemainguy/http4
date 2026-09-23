@@ -108,7 +108,7 @@ async function serve(req: Request, clientId: string): Promise<Response> {
 
   let reply: ServeReply;
   try {
-    reply = await forward(client, { http4: "serve", url: req.url, method: req.method as "GET" | "HEAD" });
+    reply = await forward(client, { http4: "serve", url: req.url, method: req.method as "GET" | "HEAD", destination: req.destination });
   } catch (err) {
     return network("fallback", `forwarding failed: ${err instanceof Error ? err.message : String(err)}`);
   }
