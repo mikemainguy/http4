@@ -23,6 +23,13 @@ export interface GrantTrace extends GrantDecision {
   others: number[];
 }
 
+/**
+ * The largest share of the budget one grant increment may demand. At 1/4 a
+ * budget always affords at least four grants, so a large minIncrement slows
+ * the grant cadence rather than withholding grants altogether.
+ */
+const MIN_INCREMENT_BUDGET_SHARE = 4;
+
 export interface SchedulerOptions {
   budget: number; // max bytes granted-but-not-received across all RPCs (see setBudget)
   minIncrement: number; // don't send a grant smaller than this unless it finishes the RPC
@@ -109,10 +116,18 @@ export class SrptScheduler {
   grants(reserved = 0): GrantDecision[] {
     const outstanding = this.outstanding();
     let available = this.budget - reserved - outstanding;
+    // Cap the increment against the budget actually in force. A minIncrement
+    // near or above the budget withholds almost every grant, because
+    // `available` is what is left after reserved and in-flight bytes are taken
+    // out — so a page that set 64 KiB against the 128 KiB floor crawled, and
+    // one that set more than the budget stopped entirely. Settings are
+    // reachable from a page's HTML, so the scheduler defends itself rather
+    // than trusting the number (vrek iss-pjpnk4q).
+    const minIncrement = Math.min(this.opts.minIncrement, Math.max(1, Math.floor(this.budget / MIN_INCREMENT_BUDGET_SHARE)));
     const candidates = [...this.rpcs.entries()]
       .filter(([, e]) => e.granted < e.size && !e.paused)
       .sort(([, a], [, b]) => a.size - a.received - (b.size - b.received) || a.seq - b.seq);
-    this.limited = candidates.length > 0 && available < this.opts.minIncrement;
+    this.limited = candidates.length > 0 && available < minIncrement;
     if (available <= 0) return [];
 
     const out: GrantDecision[] = [];
@@ -128,7 +143,7 @@ export class SrptScheduler {
       // issued, so no data arrives, so the budget never grows, so no grant is
       // issued (vrek iss-pjpnk4q; it wedged a live site).
       const stalled = outstanding === 0 && out.length === 0;
-      if (inc < this.opts.minIncrement && target < e.size && !stalled) {
+      if (inc < minIncrement && target < e.size && !stalled) {
         this.limited = true;
         break;
       }

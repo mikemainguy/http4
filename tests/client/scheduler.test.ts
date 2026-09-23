@@ -34,10 +34,30 @@ test("remaining, not total size, decides the order", () => {
 });
 
 test("strict SRPT: if the shortest can't take minIncrement, nobody longer gets a grant", () => {
-  const s = new SrptScheduler({ budget: 100, minIncrement: 50 });
-  s.add(1n, 1000, 60, 0); // 60 outstanding, only 40 free
-  s.add(2n, 5000, 0, 0);
+  // The ratio matters: minIncrement is capped at a quarter of the budget, so
+  // the original 50-of-100 here was the very case that cap exists to prevent
+  // and no longer withholds. The rule under test is unchanged — free space
+  // below minIncrement withholds from everyone — only the numbers are now a
+  // ratio a real session could have.
+  const s = new SrptScheduler({ budget: 1000, minIncrement: 50 });
+  // Big enough that the 40 free bytes can't complete it, which would be
+  // allowed regardless of minIncrement.
+  s.add(1n, 5000, 960, 0); // 960 outstanding, only 40 free
+  s.add(2n, 9000, 0, 0);
   assert.deepEqual(s.grants(), []);
+});
+
+test("minIncrement is capped at a share of the budget, so a bad setting slows grants rather than stopping them", () => {
+  // 64 KiB against the 128 KiB floor was enough to make a live site crawl:
+  // `available` is what is left after reserved and in-flight bytes, so it
+  // rarely reached the increment and grants were withheld almost always.
+  const s = new SrptScheduler({ budget: 128 * 1024, minIncrement: 64 * 1024 });
+  s.add(1n, 5_000_000, 0, 0);
+  s.onData(1n, 0);
+  // 40 KiB free is under the configured 64 KiB but over the capped 32 KiB.
+  s.add(2n, 5_000_000, 128 * 1024 - 40 * 1024, 0);
+  const gs = s.grants();
+  assert.ok(gs.length > 0, "a grant must still be issued with 40 KiB free");
 });
 
 test("a grant smaller than minIncrement is allowed if it completes the RPC", () => {
