@@ -10,6 +10,37 @@ is ordinary HTML, CSS and JavaScript. Its only HTTP4 addition is one line, first
 `http4d serve` does the rest: it serves the pages, serves the same files over HTTP4, and ships the client and
 Service Worker at `/http4/` and `/http4-sw.js`.
 
+## Saving a round trip on a slow link
+
+By default the client discovers where to connect by fetching `/config.json`, which it cannot start until
+`auto.js` has loaded. On a fast path that chain costs nothing worth naming. On a slow one it is the difference
+between carrying a page's resources and carrying none of them: measured over a throttled link, the session came
+up **~8.4 s** in, while the browser had dispatched every image at **3.1 s**, so all of them fell back to plain
+HTTP and **0%** of the page's bytes went over HTTP4 (vrek `fnd-sgw2sbh`).
+
+A page can remove that round trip by carrying the same JSON inline, before the script tag:
+
+```html
+<script type="application/http4-config">
+{"webTransportUrl": "https://example.com:443/wt", "assetPrefix": "/"}
+</script>
+<script src="/http4/auto.js"></script>
+```
+
+The values are exactly what `/config.json` serves — check with `curl -s https://example.com/config.json`, and
+use `assetPrefix` `"/"` for `http4d serve`.
+
+Three things to know before using it:
+
+- **It must match the server.** A `webTransportUrl` that is present but wrong is *used*, not validated: the
+  session fails to connect and the page runs fallback-only. It does not quietly re-read `/config.json`. If you
+  change `-advertise-wt`, change this too.
+- **It is for a trusted certificate only.** The dev certificate's `certHash` changes every run, so a
+  development server must keep using `/config.json`. This is why the demo site above does not ship an inline
+  block — it would pin the demo to one deployment and break `bin/http4d serve` locally.
+- **A malformed block is harmless.** Invalid JSON, an empty block, or one without `webTransportUrl` is ignored
+  and `/config.json` is fetched as before. It costs the round trip back, not the session.
+
 ## Run it
 
 ```sh

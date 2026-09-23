@@ -179,6 +179,36 @@ interface ServerConfig {
   assetPrefix?: string;
 }
 
+/**
+ * A page can carry the same JSON inline, so opening a session costs no round
+ * trip of its own:
+ *
+ *   <script type="application/http4-config">{"webTransportUrl":"…"}</script>
+ *
+ * That matters most on a slow link, where the chain HTML → auto.js →
+ * /config.json → handshake finishes after the browser has already dispatched
+ * the subresources the session was meant to carry (vrek fnd-sgw2sbh). `http4d
+ * serve` injects this into the HTML it serves; /config.json stays the fallback
+ * for a hand-written page, so a bare tag keeps working.
+ */
+export const INLINE_CONFIG_TYPE = "application/http4-config";
+
+/** The page's inline config, or undefined when there isn't a usable one. */
+function inlineConfig(): ServerConfig | undefined {
+  if (typeof document === "undefined") return undefined;
+  const el = document.querySelector(`script[type="${INLINE_CONFIG_TYPE}"]`);
+  const text = el?.textContent?.trim();
+  if (!text) return undefined;
+  try {
+    const cfg: unknown = JSON.parse(text);
+    // A malformed or empty block is ignored rather than fatal: /config.json
+    // still answers, so a bad inline block costs a round trip, not the session.
+    return typeof cfg === "object" && cfg !== null ? (cfg as ServerConfig) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function openSession(
   url: string | undefined,
   hash: Uint8Array<ArrayBuffer> | string | undefined,
@@ -190,15 +220,22 @@ async function openSession(
 ): Promise<Http4Client> {
   const noWebTransport = typeof WebTransport === "undefined";
   if (url === undefined) {
-    // Read the config even without WebTransport, because its assetPrefix
-    // decides which requests count as HTTP4-eligible fallbacks. Then a
-    // config problem is secondary: the reason reported is the missing API.
-    try {
-      const res = await platformFetch(configUrl, { cache: "no-store" });
-      if (!res.ok) throw new Error(`config ${configUrl}: HTTP ${res.status}`);
-      Object.assign(cfgOut, (await res.json()) as ServerConfig);
-    } catch (e) {
-      if (!noWebTransport) throw e;
+    // An inline config is already in the parsed HTML, so it saves the round
+    // trip /config.json would cost before the session can even be attempted.
+    const inline = inlineConfig();
+    if (inline?.webTransportUrl) {
+      Object.assign(cfgOut, inline);
+    } else {
+      // Read the config even without WebTransport, because its assetPrefix
+      // decides which requests count as HTTP4-eligible fallbacks. Then a
+      // config problem is secondary: the reason reported is the missing API.
+      try {
+        const res = await platformFetch(configUrl, { cache: "no-store" });
+        if (!res.ok) throw new Error(`config ${configUrl}: HTTP ${res.status}`);
+        Object.assign(cfgOut, (await res.json()) as ServerConfig);
+      } catch (e) {
+        if (!noWebTransport) throw e;
+      }
     }
     if (noWebTransport) throw new Error("WebTransport not supported");
     if (!cfgOut.webTransportUrl) throw new Error(`config ${configUrl}: no webTransportUrl`);

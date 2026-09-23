@@ -85,6 +85,51 @@ test("config.json's assetPrefix is honoured even without WebTransport", async ()
   assert.equal(explicit.assetPrefix, "/static/", "an explicit option wins over the config");
 });
 
+test("an inline config is used instead of fetching /config.json, and a bad one falls back to it", async () => {
+  const base = ORIGIN + "/index.html";
+  let fetched = 0;
+  const countingFetch = (cfg: object) => async (input: RequestInfo | URL) => {
+    assert.match(String(input), /\/config\.json$/);
+    fetched++;
+    return new Response(JSON.stringify(cfg), { headers: { "content-type": "application/json" } });
+  };
+  // Stand in for the page's document: only querySelector on the config block.
+  const withInline = (text: string | null, run: () => Promise<void>) => {
+    const g = globalThis as { document?: unknown };
+    const had = "document" in g;
+    const prev = g.document;
+    g.document = { querySelector: (sel: string) => (sel.includes("application/http4-config") && text !== null ? { textContent: text } : null) };
+    return run().finally(() => {
+      if (had) g.document = prev;
+      else delete g.document;
+    });
+  };
+
+  await withInline('{"webTransportUrl":"https://inline/wt","assetPrefix":"/"}', async () => {
+    fetched = 0;
+    const o = await open({ baseUrl: base, fetch: countingFetch({ webTransportUrl: "https://fetched/wt", assetPrefix: "/assets/" }) });
+    assert.equal(fetched, 0, "the inline config saves the round trip");
+    assert.equal(o.assetPrefix, "/", "and its assetPrefix is the one in effect");
+  });
+
+  // Malformed, empty, and absent-webTransportUrl blocks are ignored rather
+  // than fatal: they cost a round trip, not the session.
+  for (const bad of ["{not json", "", "   ", "{}", '{"assetPrefix":"/"}', "[1,2]"]) {
+    await withInline(bad, async () => {
+      fetched = 0;
+      const o = await open({ baseUrl: base, fetch: countingFetch({ webTransportUrl: "https://fetched/wt", assetPrefix: "/" }) });
+      assert.equal(fetched, 1, `"${bad}" should fall back to /config.json`);
+      assert.equal(o.assetPrefix, "/");
+    });
+  }
+
+  // No document at all (the library used outside a page) still works.
+  fetched = 0;
+  const o = await open({ baseUrl: base, fetch: countingFetch({ webTransportUrl: "https://fetched/wt", assetPrefix: "/" }) });
+  assert.equal(fetched, 1);
+  assert.equal(o.assetPrefix, "/");
+});
+
 test("outcome() gives HTTP4 bodies, a HEAD without one, an authoritative 404, and fallback reasons", async () => {
   const body = new Uint8Array([104, 105]);
   const session: AssetRequester = {
