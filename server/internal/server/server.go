@@ -240,17 +240,6 @@ func Start(cfg Config) (*Server, error) {
 		H3:          h3,
 		CheckOrigin: s.allowedOrigin,
 	}
-	wtMux := http.NewServeMux()
-	wtMux.HandleFunc(WebTransportPath, s.upgrade(func(sess *webtransport.Session) {
-		sender.Serve(sess.Context(), sess, sender.Config{Assets: s.pool, Metrics: s.metrics, NewDropper: newDropper, NoSeq: cfg.NoSeq,
-			SendQueueTarget: cfg.SendQueueTarget})
-	}))
-	wtMux.HandleFunc(EchoPath, s.upgrade(echoDatagrams))
-	if !cfg.NoH3 {
-		wtMux.HandleFunc(H3Path, s.handleH3Asset)
-	}
-	h3.Handler = wtMux
-
 	httpMux := http.NewServeMux()
 	httpMux.HandleFunc("/config.json", s.handleConfig)
 	httpMux.HandleFunc("/metrics.json", s.handleMetrics)
@@ -264,6 +253,27 @@ func Start(cfg Config) (*Server, error) {
 		httpMux.Handle(assetPrefix, http.StripPrefix(assetPrefix, http.HandlerFunc(s.handleAsset)))
 		httpMux.Handle("/", http.FileServer(http.Dir(cfg.StaticDir)))
 	}
+
+	wtMux := http.NewServeMux()
+	wtMux.HandleFunc(WebTransportPath, s.upgrade(func(sess *webtransport.Session) {
+		sender.Serve(sess.Context(), sess, sender.Config{Assets: s.pool, Metrics: s.metrics, NewDropper: newDropper, NoSeq: cfg.NoSeq,
+			SendQueueTarget: cfg.SendQueueTarget})
+	}))
+	wtMux.HandleFunc(EchoPath, s.upgrade(echoDatagrams))
+	if !cfg.NoH3 {
+		wtMux.HandleFunc(H3Path, s.handleH3Asset)
+	}
+	if cfg.AltSvc {
+		// Alt-Svc promises the WHOLE origin over HTTP/3, so the QUIC listener
+		// has to answer every path the TCP one does. Without this a browser
+		// that took the advertisement gets a 404 for the page itself, marks
+		// the alternative broken, and goes back to TCP — which looks exactly
+		// like the header having no effect. The more specific patterns above
+		// still win, so /wt, /echo and /h3/ keep their own handlers.
+		wtMux.Handle("/", httpMux)
+	}
+	h3.Handler = wtMux
+
 	var handler http.Handler = httpMux
 	if cfg.AltSvc {
 		if alt := altSvcValue(s.WebTransportURL, udpConn.LocalAddr().String()); alt != "" {

@@ -1,8 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -61,5 +64,57 @@ func TestAltSvcOffByDefault(t *testing.T) {
 	}
 	if strings.Contains(s.WebTransportURL, "[::]") {
 		t.Errorf("test server advertised a wildcard address: %q", s.WebTransportURL)
+	}
+}
+
+// Alt-Svc promises the whole origin over HTTP/3, so the QUIC listener must
+// answer every path the TCP one does. An earlier version advertised without
+// doing this: a browser that took the advertisement got a 404 for the page
+// itself, marked the alternative broken, and silently went back to TCP.
+func TestAltSvcServesTheWholeOriginOverH3(t *testing.T) {
+	static := t.TempDir()
+	page := []byte("<!doctype html><title>hi</title>")
+	if err := os.WriteFile(filepath.Join(static, "index.html"), page, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Start(Config{
+		HTTPAddr: "127.0.0.1:0", WTAddr: "127.0.0.1:0",
+		StaticDir: static, AssetsDir: t.TempDir(), AltSvc: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	if got := altSvcValue(s.WebTransportURL, s.WTListenAddr); got == "" {
+		t.Fatal("no Alt-Svc value for a real listener")
+	}
+	cfg := fetchConfig(t, s)
+	c := h3Client(t, cfg)
+	base := strings.TrimSuffix(cfg.H3URL, H3Path)
+
+	// The page itself, which is what a browser asks for after upgrading.
+	rsp, body := h3Get(t, c, base+"/index.html", s.HTTPURL)
+	if rsp.StatusCode != http.StatusOK || !bytes.Equal(body, page) {
+		t.Fatalf("GET /index.html over h3: %s, %q", rsp.Status, body)
+	}
+	if rsp.Proto != "HTTP/3.0" {
+		t.Errorf("proto %q, want HTTP/3.0", rsp.Proto)
+	}
+	// And /config.json, which the client fetches before it can do anything.
+	if rsp, _ := h3Get(t, c, base+"/config.json", s.HTTPURL); rsp.StatusCode != http.StatusOK {
+		t.Errorf("GET /config.json over h3: %s", rsp.Status)
+	}
+}
+
+// Without the flag the QUIC listener keeps serving only its own routes, so
+// nothing changes for anyone not asking for the HTTP/3 baseline.
+func TestWithoutAltSvcTheOriginIsNotServedOverH3(t *testing.T) {
+	s := startTestServer(t, map[string][]byte{"a.txt": []byte("hi")})
+	cfg := fetchConfig(t, s)
+	c := h3Client(t, cfg)
+	base := strings.TrimSuffix(cfg.H3URL, H3Path)
+	if rsp, _ := h3Get(t, c, base+"/config.json", s.HTTPURL); rsp.StatusCode != http.StatusNotFound {
+		t.Errorf("GET /config.json over h3 without -alt-svc: %s, want 404", rsp.Status)
 	}
 }
