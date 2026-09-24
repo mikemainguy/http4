@@ -17,6 +17,12 @@
 //   npm run bench:g3 [-- --out results.json] [--conditions clean,1x50]
 //                    [--repeats 5] [--samples 500] [--rate 50] [--bg 4]
 //                    [--send-queue k]   (http4d -send-queue; negative = don't pace)
+//                    [--tail-duplicate bytes]
+//                      http4d -tail-duplicate: repeat the final packet of a
+//                      response no larger than this, so a lost tail is not left
+//                      to the client's stall timer (vrek iss-px7fmgg). The p99
+//                      of the small replies is what should move; the median is
+//                      already one round trip.
 //
 // Progress goes to stderr, one JSON object to stdout. Exits 0 whatever the
 // numbers say: this measures, it does not judge.
@@ -144,7 +150,10 @@ async function runStack(page: Page, sp: StackSpec, args: Args): Promise<StackRes
 
 async function runCondition(c: Condition, assets: AssetSet, args: Args): Promise<ConditionResult> {
   const started = performance.now();
-  const serverArgs = args.sendQueue === undefined ? [] : ["-send-queue", String(args.sendQueue)];
+  const serverArgs = [
+    ...(args.sendQueue === undefined ? [] : ["-send-queue", String(args.sendQueue)]),
+    ...(args.tailDuplicate === undefined ? [] : ["-tail-duplicate", String(args.tailDuplicate)]),
+  ];
   const h: Harness = await startHarness(assets.dir, serverArgs, { h3: true, ...(c.impair ? { impair: c.impair } : {}) });
   try {
     const page = await h.browser.newPage();
@@ -187,6 +196,7 @@ interface Args {
   rate: number;
   bg: number;
   sendQueue?: number;
+  tailDuplicate?: number;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -198,9 +208,11 @@ function parseArgs(argv: string[]): Args {
   const conditions = names ? names.map((n) => CONDITIONS.find((c) => c.name === n) ?? die(`unknown condition ${n}`)) : CONDITIONS;
   const out = get("--out");
   const sendQueue = get("--send-queue");
+  const tailDuplicate = get("--tail-duplicate");
   return {
     ...(out ? { out } : {}),
     ...(sendQueue === undefined ? {} : { sendQueue: Number(sendQueue) }),
+    ...(tailDuplicate === undefined ? {} : { tailDuplicate: Number(tailDuplicate) }),
     conditions,
     repeats: Number(get("--repeats") ?? 5),
     samples: Number(get("--samples") ?? 500),
