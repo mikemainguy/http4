@@ -89,7 +89,7 @@ func TestAssetsOverHTTPRejects(t *testing.T) {
 // an ID that escapes the assets directory is refused by os.Root.
 func TestAssetHandlerRefusesEscape(t *testing.T) {
 	// No listeners needed: the handler only uses the asset store.
-	assets, err := sender.OpenDir(t.TempDir())
+	assets, err := sender.OpenDir(t.TempDir(), 8, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

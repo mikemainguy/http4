@@ -43,13 +43,14 @@ func main() {
 	advertiseWT := flag.String("advertise-wt", "", "host:port to advertise for WebTransport instead of -wt's, e.g. an impairment proxy in front of it")
 	noSeq := flag.Bool("no-seq", false, "don't negotiate session sequence numbers (wire v2); send plain v1 DATA to every client")
 	tailDup := flag.Int("tail-duplicate", 0, "repeat the final packet of a response no larger than this many bytes, so a lost tail is not left to the client's stall timer; 0 = off")
+	cacheMB := flag.Int("cache-mb", server.DefaultCacheMB, "megabytes of assets to hold in memory; over the bound the least recently used is dropped; 0 = read from disk every time")
 	sendQueue := flag.Int("send-queue", 0, "datagrams of bulk to leave in QUIC's send queue ahead of the sender's next pick; 0 or negative = don't pace")
 	flag.Parse()
 
 	run(server.Config{
 		HTTPAddr: *httpAddr, WTAddr: *wtAddr, StaticDir: *static, AssetsDir: *assets,
 		DropSpec: *drop, AdvertiseWT: *advertiseWT, AssetPrefix: *assetPrefix, NoSeq: *noSeq,
-		SendQueueTarget: *sendQueue, TailDuplicate: *tailDup,
+		SendQueueTarget: *sendQueue, TailDuplicate: *tailDup, CacheMB: *cacheMB,
 	})
 }
 

@@ -26,6 +26,7 @@ import (
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/webtransport-go"
 
+	"http4/server/internal/bytecache"
 	"http4/server/internal/certs"
 	"http4/server/internal/sender"
 )
@@ -114,7 +115,19 @@ type Config struct {
 	// Metrics decides who may read /metrics.json. The zero value is Public,
 	// which is what the sandbox server and its tests expect.
 	Metrics MetricsAccess
+
+	// CacheMB bounds the in-memory asset cache, in whole megabytes. Zero — the
+	// zero value — caches nothing and reads every asset from disk on every
+	// request; the command-line entry points default it to DefaultCacheMB.
+	// Over the bound the least recently used asset is dropped, and a line is
+	// logged once to say the bound is binding (vrek iss-0yd99d2).
+	CacheMB int
 }
+
+// DefaultCacheMB is the asset cache budget the command-line entry points use
+// when -cache-mb is not given. Large enough for an ordinary site's static
+// build, small enough to be unremarkable on any host that can run a server.
+const DefaultCacheMB = 64
 
 // MetricsAccess says who may read /metrics.json.
 type MetricsAccess int
@@ -210,7 +223,7 @@ func Start(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	assets, err := sender.OpenDir(assetsDir)
+	assets, err := sender.OpenDir(assetsDir, cfg.CacheMB, nil)
 	if err != nil {
 		return nil, fmt.Errorf("assets: %w", err)
 	}
@@ -395,7 +408,16 @@ func (s *Server) Close() error {
 }
 
 // Metrics returns the HTTP4 counters shared by every session.
-func (s *Server) Metrics() sender.Snapshot { return s.metrics.Snapshot() }
+// MetricsSnapshot is everything /metrics.json reports. The two halves are
+// embedded, so the JSON stays one flat object of counters.
+type MetricsSnapshot struct {
+	sender.Snapshot
+	bytecache.Stats
+}
+
+func (s *Server) Metrics() MetricsSnapshot {
+	return MetricsSnapshot{Snapshot: s.metrics.Snapshot(), Stats: s.assets.CacheStats()}
+}
 
 func (s *Server) ClientConfig() ClientConfig {
 	return ClientConfig{

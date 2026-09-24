@@ -64,6 +64,7 @@ func parseServe(args []string, out io.Writer) (server.Config, error) {
 	advertiseWT := fs.String("advertise-wt", "", "advertise this `host:port` for WebTransport, e.g. an impairment proxy")
 	tailDup := fs.Int("tail-duplicate", 0, "repeat the final packet of a response no larger than this many `bytes`, so a\nlost tail is not left to the client's stall timer. A small reply has nothing\nbehind its last packet to reveal the loss. 0 = off")
 	noSeq := fs.Bool("no-seq", false, "don't negotiate session sequence numbers (wire v2); send plain v1 DATA to every client")
+	cacheMB := fs.Int("cache-mb", server.DefaultCacheMB, "`megabytes` of assets to hold in memory. Over the bound the least recently\nused asset is dropped and re-read from disk next time. 0 = read every asset\nfrom disk on every request")
 	sendQueue := fs.Int("send-queue", 0, "datagrams of bulk to leave in QUIC's send queue ahead of the sender's next pick; 0 or negative = don't pace")
 	fs.Usage = func() {
 		fmt.Fprint(out, serveUsage, "\nFlags:\n")
@@ -127,6 +128,7 @@ func parseServe(args []string, out io.Writer) (server.Config, error) {
 		NoSeq:           *noSeq,
 		TailDuplicate:   *tailDup,
 		SendQueueTarget: *sendQueue,
+		CacheMB:         *cacheMB,
 		Cert:            mode,
 		Origins:         origins,
 		RedirectAddr:    redirectAddr,

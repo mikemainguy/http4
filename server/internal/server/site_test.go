@@ -139,7 +139,7 @@ func TestSiteHandlerRefusesTraversal(t *testing.T) {
 	site := filepath.Join(root, "site")
 	os.MkdirAll(site, 0o755)
 	os.WriteFile(filepath.Join(root, "secret.txt"), []byte("outside"), 0o644)
-	assets, err := sender.OpenDir(site)
+	assets, err := sender.OpenDir(site, 8, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
