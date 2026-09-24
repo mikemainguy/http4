@@ -47,6 +47,21 @@ type Config struct {
 	// NoSeq ignores the client's HELLO, so sessions keep plain v1 DATA even
 	// when the client offers session sequence numbers.
 	NoSeq bool
+	// TailDuplicate proactively sends the last DATA of a small response twice,
+	// in bytes: a response no larger than this has its final packet repeated,
+	// and 0 turns it off.
+	//
+	// HTTP4 finds a loss by noticing a gap in what arrives, so it needs
+	// something to arrive AFTER the lost packet. A 1-4 packet reply has
+	// nothing behind its last one, so a lost tail is only found by the stall
+	// timer, ~1.5-2 RTT later, where QUIC would see it in its own
+	// acknowledgements (vrek fnd-e6ryjav, iss-px7fmgg). One extra datagram
+	// removes the common single-loss case outright.
+	//
+	// The copy goes out immediately after the original, which is the right
+	// shape for independent loss and the wrong one for a burst that takes
+	// both. Spacing it would need a timer and is not done here.
+	TailDuplicate int
 	// SendQueueTarget is how many datagrams the sender leaves sitting in QUIC's
 	// send queue ahead of the packet it picks next: 0 takes
 	// DefaultSendQueueTarget, which is off, and any negative value is off too,
@@ -128,6 +143,7 @@ type rpc struct {
 	next        uint32 // first byte never sent
 	metaSent    uint64 // REQ generation the last META answered
 	packet0Sent uint64
+	tailDuped   bool // its final packet has already been repeated (TailDuplicate)
 }
 
 type session struct {
@@ -587,6 +603,18 @@ func (s *session) send(ctx context.Context, w work) bool {
 		s.m.ResentBytes.Add(int64(len(d.Payload)))
 	case workNew:
 		w.r.next += uint32(len(d.Payload))
+	}
+	// A small response has nothing following its last packet to reveal that it
+	// was lost, so repeat it now rather than let the stall timer find it. The
+	// copy is queued as a resend: the bytes are inside the grant (they were
+	// just sent), so G2 still holds, and the existing path carries it.
+	if s.cfg.TailDuplicate > 0 && isData && !w.r.tailDuped && w.kind != workResend &&
+		w.r.size > 0 && int(w.r.size) <= s.cfg.TailDuplicate && w.r.next == w.r.size {
+		w.r.tailDuped = true
+		off := d.Offset
+		w.r.resends = append(w.r.resends, span{start: off, end: off + uint32(len(d.Payload))})
+		s.m.TailDuplicates.Add(1)
+		s.m.TailDuplicateBytes.Add(int64(len(d.Payload)))
 	}
 	if isData && w.seq {
 		// The number is used up whether the datagram arrived or was dropped

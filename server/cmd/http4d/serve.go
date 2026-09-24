@@ -62,6 +62,7 @@ func parseServe(args []string, out io.Writer) (server.Config, error) {
 	clientDir := fs.String("client-dir", "", "serve /http4/ from this `directory` (e.g. client/dist) instead of the built-in bundle")
 	drop := fs.String("drop", "", "drop outgoing DATA to simulate loss: a `spec` like every=7,packet0,final,rate=0.05,seed=1")
 	advertiseWT := fs.String("advertise-wt", "", "advertise this `host:port` for WebTransport, e.g. an impairment proxy")
+	tailDup := fs.Int("tail-duplicate", 0, "repeat the final packet of a response no larger than this many `bytes`, so a\nlost tail is not left to the client's stall timer. A small reply has nothing\nbehind its last packet to reveal the loss. 0 = off")
 	noSeq := fs.Bool("no-seq", false, "don't negotiate session sequence numbers (wire v2); send plain v1 DATA to every client")
 	sendQueue := fs.Int("send-queue", 0, "datagrams of bulk to leave in QUIC's send queue ahead of the sender's next pick; 0 or negative = don't pace")
 	fs.Usage = func() {
@@ -124,6 +125,7 @@ func parseServe(args []string, out io.Writer) (server.Config, error) {
 		DropSpec:        *drop,
 		AdvertiseWT:     *advertiseWT,
 		NoSeq:           *noSeq,
+		TailDuplicate:   *tailDup,
 		SendQueueTarget: *sendQueue,
 		Cert:            mode,
 		Origins:         origins,

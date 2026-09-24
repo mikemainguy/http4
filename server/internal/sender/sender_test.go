@@ -539,3 +539,130 @@ func TestSendMicrosCountsEveryHandoverNotOnlyBlockedOnes(t *testing.T) {
 			h.m.SendMicros.Load(), h.m.SendBlockedMicros.Load())
 	}
 }
+
+// HTTP4 finds a loss by seeing a gap in what arrives, so it needs something to
+// arrive after the lost packet. A small reply has nothing behind its last one,
+// leaving a lost tail to the stall timer ~1.5-2 RTT later (vrek fnd-e6ryjav).
+// TailDuplicate sends that packet twice so the common single loss is covered.
+func TestTailDuplicateRepeatsTheLastPacketOfASmallReply(t *testing.T) {
+	a := asset(3000) // three packets at the test chunk size
+	h := start(t, MapAssets{"a": a}, func(c *Config) { c.TailDuplicate = 8000 })
+	h.send(&wire.Req{RPCID: 1, InitialGrant: 3000, AssetID: "a"})
+	ds := datas(h.drain(quiet))
+
+	got, _ := assemble(len(a), ds)
+	if !bytes.Equal(got, a) {
+		t.Fatal("the asset did not arrive intact")
+	}
+	// Exactly one packet was sent twice, and it is the last one.
+	last := ds[len(ds)-1]
+	end := last.Offset + uint32(len(last.Payload))
+	if end != uint32(len(a)) {
+		t.Fatalf("the repeated packet ends at %d, not at the end of the asset (%d)", end, len(a))
+	}
+	same := 0
+	for _, d := range ds {
+		if d.Offset == last.Offset && len(d.Payload) == len(last.Payload) {
+			same++
+		}
+	}
+	if same != 2 {
+		t.Errorf("the final packet went out %d times, want 2", same)
+	}
+	if n := h.m.TailDuplicates.Load(); n != 1 {
+		t.Errorf("TailDuplicates = %d, want 1", n)
+	}
+	if n := h.m.TailDuplicateBytes.Load(); n != int64(len(last.Payload)) {
+		t.Errorf("TailDuplicateBytes = %d, want %d", n, len(last.Payload))
+	}
+	// The extra bytes are inside the grant, so G2 is untouched (the harness
+	// checks UngrantedSent at cleanup, and the fake conn checks every DATA).
+}
+
+// The point is to cover a SMALL reply. Bulk has plenty of traffic behind it to
+// reveal a loss, so repeating its tail would be wasted bytes.
+func TestTailDuplicateLeavesLargeRepliesAlone(t *testing.T) {
+	a := asset(60_000)
+	h := start(t, MapAssets{"a": a}, func(c *Config) { c.TailDuplicate = 8000 })
+	h.send(&wire.Req{RPCID: 1, InitialGrant: 60_000, AssetID: "a"})
+	h.drain(quiet)
+	if n := h.m.TailDuplicates.Load(); n != 0 {
+		t.Errorf("TailDuplicates = %d for a 60 KB reply, want 0", n)
+	}
+}
+
+// Off by default: the extra datagram is a cost, and nothing should pay it
+// until a measurement says it is worth paying.
+func TestTailDuplicateIsOffByDefault(t *testing.T) {
+	a := asset(2000)
+	h := start(t, MapAssets{"a": a}, nil)
+	h.send(&wire.Req{RPCID: 1, InitialGrant: 2000, AssetID: "a"})
+	ds := datas(h.drain(quiet))
+	if n := h.m.TailDuplicates.Load(); n != 0 {
+		t.Errorf("TailDuplicates = %d with the zero Config, want 0", n)
+	}
+	if got, n := assemble(len(a), ds); !bytes.Equal(got, a) || n != len(a) {
+		t.Fatalf("got %d bytes, want exactly the asset once", n)
+	}
+}
+
+// The duplicate must not itself be duplicated, or a reply would repeat forever.
+func TestTailDuplicateHappensOnce(t *testing.T) {
+	a := asset(2000)
+	h := start(t, MapAssets{"a": a}, func(c *Config) { c.TailDuplicate = 8000 })
+	h.send(&wire.Req{RPCID: 1, InitialGrant: 2000, AssetID: "a"})
+	h.drain(quiet)
+	// A repeated REQ resends packet 0 and the client may RESEND too; neither
+	// should add another proactive copy.
+	h.send(&wire.Req{RPCID: 1, InitialGrant: 2000, AssetID: "a"})
+	h.send(&wire.Resend{RPCID: 1, Start: 0, End: 2000})
+	h.drain(quiet)
+	if n := h.m.TailDuplicates.Load(); n != 1 {
+		t.Errorf("TailDuplicates = %d after a repeated REQ and a RESEND, want 1", n)
+	}
+}
+
+// The whole point, end to end: the final packet is lost on the wire and the
+// reply still completes, without the client asking and without the stall timer.
+// The drop spec targets first transmissions only, so it takes the original and
+// leaves the proactive copy — which is exactly the loss this covers.
+func TestTailDuplicateCoversALostFinalPacket(t *testing.T) {
+	a := asset(3000)
+	newDrop, err := ParseDropSpec("final")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := start(t, MapAssets{"a": a}, func(c *Config) {
+		c.TailDuplicate = 8000
+		c.NewDropper = newDrop
+	})
+	h.send(&wire.Req{RPCID: 1, InitialGrant: 3000, AssetID: "a"})
+	ds := datas(h.drain(quiet))
+
+	got, n := assemble(len(a), ds)
+	if !bytes.Equal(got, a) || n != len(a) {
+		t.Fatalf("got %d of %d bytes with the final packet dropped; the duplicate did not cover it", n, len(a))
+	}
+	if dropped := h.m.DroppedData.Load(); dropped != 1 {
+		t.Errorf("DroppedData = %d, want the one final packet", dropped)
+	}
+	if n := h.m.TailDuplicates.Load(); n != 1 {
+		t.Errorf("TailDuplicates = %d, want 1", n)
+	}
+}
+
+// Without it, the same loss leaves the reply incomplete until the client's
+// stall timer notices — which is the cost this feature exists to remove.
+func TestWithoutTailDuplicateALostFinalPacketIsNotCovered(t *testing.T) {
+	a := asset(3000)
+	newDrop, err := ParseDropSpec("final")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := start(t, MapAssets{"a": a}, func(c *Config) { c.NewDropper = newDrop })
+	h.send(&wire.Req{RPCID: 1, InitialGrant: 3000, AssetID: "a"})
+	_, n := assemble(len(a), datas(h.drain(quiet)))
+	if n >= len(a) {
+		t.Fatalf("got %d of %d bytes; the final packet should still be missing", n, len(a))
+	}
+}

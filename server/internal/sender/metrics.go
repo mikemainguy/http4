@@ -25,9 +25,15 @@ type Metrics struct {
 	SeqResendMisses  atomic.Int64 // sequence numbers asked for that the ring no longer held
 	SeqResendRepeats atomic.Int64 // sequence numbers asked for again after they were already resent
 	// Keeping QUIC's send queue shallow (pacer):
-	SendMicros        atomic.Int64 // total time in SendDatagram, every call, whether or not it waited
-	SendBlocked       atomic.Int64 // sends that waited because QUIC's queue was full
-	SendBlockedMicros atomic.Int64 // how long those waited, in total
+	// Proactive tail repair (Config.TailDuplicate): the final packet of a small
+	// response, sent a second time so a lost tail is not left to the stall
+	// timer. Its bytes are also counted in ResentBytes, since it travels as a
+	// resend; these separate what was asked for from what was volunteered.
+	TailDuplicates     atomic.Int64
+	TailDuplicateBytes atomic.Int64
+	SendMicros         atomic.Int64 // total time in SendDatagram, every call, whether or not it waited
+	SendBlocked        atomic.Int64 // sends that waited because QUIC's queue was full
+	SendBlockedMicros  atomic.Int64 // how long those waited, in total
 	// Why the send loop had nothing to send. SendIdle counts every wait;
 	// SendUngranted counts the subset where an RPC still had bytes left but
 	// none of them granted, i.e. the receiver's grants were the hold-up rather
@@ -64,6 +70,8 @@ type Snapshot struct {
 	SeqResends          int64 `json:"seq_resends"`
 	SeqResendMisses     int64 `json:"seq_resend_misses"`
 	SeqResendRepeats    int64 `json:"seq_resend_repeats"`
+	TailDuplicates      int64 `json:"tail_duplicates"`
+	TailDuplicateBytes  int64 `json:"tail_duplicate_bytes"`
 	SendMicros          int64 `json:"send_micros"`
 	SendBlocked         int64 `json:"send_blocked"`
 	SendBlockedMicros   int64 `json:"send_blocked_micros"`
@@ -97,6 +105,8 @@ func (m *Metrics) Snapshot() Snapshot {
 		SeqResends:          m.SeqResends.Load(),
 		SeqResendMisses:     m.SeqResendMisses.Load(),
 		SeqResendRepeats:    m.SeqResendRepeats.Load(),
+		TailDuplicates:      m.TailDuplicates.Load(),
+		TailDuplicateBytes:  m.TailDuplicateBytes.Load(),
 		SendMicros:          m.SendMicros.Load(),
 		SendBlocked:         m.SendBlocked.Load(),
 		SendBlockedMicros:   m.SendBlockedMicros.Load(),

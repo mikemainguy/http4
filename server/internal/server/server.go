@@ -46,6 +46,10 @@ type Config struct {
 	AssetsDir string // directory HTTP4 REQs are served from
 	DropSpec  string // loss injection for outgoing DATA (sender.ParseDropSpec); testing only
 	NoSeq     bool   // ignore clients' HELLO: plain v1 DATA only (sender.Config.NoSeq)
+	// TailDuplicate repeats the final DATA of a response no larger than this
+	// many bytes, so a lost tail is not left to the client's stall timer
+	// (sender.Config.TailDuplicate). 0 is off.
+	TailDuplicate int
 	// SendQueueTarget is how many datagrams the sender leaves in QUIC's send
 	// queue ahead of its next pick. 0 and negative values leave pacing off; a
 	// positive k paces bulk (sender.Config.SendQueueTarget).
@@ -302,7 +306,7 @@ func Start(cfg Config) (*Server, error) {
 
 	wtMux := http.NewServeMux()
 	wtMux.HandleFunc(WebTransportPath, s.upgrade(func(sess *webtransport.Session) {
-		sender.Serve(sess.Context(), sess, sender.Config{Assets: s.pool, Metrics: s.metrics, NewDropper: newDropper, NoSeq: cfg.NoSeq,
+		sender.Serve(sess.Context(), sess, sender.Config{Assets: s.pool, Metrics: s.metrics, NewDropper: newDropper, NoSeq: cfg.NoSeq, TailDuplicate: cfg.TailDuplicate,
 			SendQueueTarget: cfg.SendQueueTarget})
 	}))
 	wtMux.HandleFunc(EchoPath, s.upgrade(echoDatagrams))
