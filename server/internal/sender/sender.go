@@ -143,7 +143,8 @@ type rpc struct {
 	next        uint32 // first byte never sent
 	metaSent    uint64 // REQ generation the last META answered
 	packet0Sent uint64
-	tailDuped   bool // its final packet has already been repeated (TailDuplicate)
+	tailDuped   bool  // its final packet has already been queued for repeat (TailDuplicate)
+	tailDup     *span // the range to repeat, once, when nothing else is due
 }
 
 type session struct {
@@ -348,6 +349,11 @@ const (
 	workPacket0
 	workResend
 	workNew
+	// Last on purpose: a proactive copy must never delay real work. Queuing it
+	// as a resend put it ABOVE new data, so every reply's duplicate preempted
+	// the next reply's first packet — a priority inversion that made the p99 it
+	// was meant to fix substantially worse (vrek fnd-29f7680).
+	workTailDup
 )
 
 func (s *session) sendLoop(ctx context.Context) {
@@ -466,6 +472,9 @@ func (s *session) pick() (work, bool) {
 	case workPacket0:
 		n := min(chunk, r.granted)
 		return work{pkt: r.data(0, n), r: r, kind: workPacket0, packet0: r.packet0Req, seq: seq}, true
+	case workTailDup:
+		sp := *r.tailDup
+		return work{pkt: r.data(sp.start, sp.end-sp.start), r: r, kind: workTailDup, seq: seq}, true
 	case workResend:
 		sp := r.resends[0]
 		n := min(chunk, sp.end-sp.start)
@@ -511,6 +520,8 @@ func (r *rpc) due() (workKind, bool) {
 		return workResend, true
 	case r.next < r.granted:
 		return workNew, true
+	case r.tailDup != nil:
+		return workTailDup, true
 	}
 	return 0, false
 }
@@ -603,6 +614,11 @@ func (s *session) send(ctx context.Context, w work) bool {
 		s.m.ResentBytes.Add(int64(len(d.Payload)))
 	case workNew:
 		w.r.next += uint32(len(d.Payload))
+	case workTailDup:
+		w.r.tailDup = nil
+		s.m.TailDuplicates.Add(1)
+		s.m.TailDuplicateBytes.Add(int64(len(d.Payload)))
+		s.m.ResentBytes.Add(int64(len(d.Payload)))
 	}
 	// A small response has nothing following its last packet to reveal that it
 	// was lost, so repeat it now rather than let the stall timer find it. The
@@ -612,9 +628,7 @@ func (s *session) send(ctx context.Context, w work) bool {
 		w.r.size > 0 && int(w.r.size) <= s.cfg.TailDuplicate && w.r.next == w.r.size {
 		w.r.tailDuped = true
 		off := d.Offset
-		w.r.resends = append(w.r.resends, span{start: off, end: off + uint32(len(d.Payload))})
-		s.m.TailDuplicates.Add(1)
-		s.m.TailDuplicateBytes.Add(int64(len(d.Payload)))
+		w.r.tailDup = &span{start: off, end: off + uint32(len(d.Payload))}
 	}
 	if isData && w.seq {
 		// The number is used up whether the datagram arrived or was dropped
@@ -662,7 +676,10 @@ func (w work) dropInfo(d *wire.Data) DropInfo {
 		Packet0: d.Offset == 0,
 		Final:   d.TotalSize > 0 && end == d.TotalSize,
 		// Only the send loop writes r.next, and this runs on the send loop.
-		Resend: w.kind == workResend || (w.kind == workPacket0 && w.r.next >= end),
+		// A tail duplicate is a retransmission by definition, so loss injection
+		// aimed at first transmissions must leave it alone — otherwise the
+		// dropper takes both copies and the feature can never be tested.
+		Resend: w.kind == workResend || w.kind == workTailDup || (w.kind == workPacket0 && w.r.next >= end),
 	}
 }
 
