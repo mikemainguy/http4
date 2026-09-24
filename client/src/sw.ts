@@ -50,6 +50,20 @@ interface TabState {
   acked: Promise<boolean>;
   ready: Promise<Ready>;
   info?: Ready;
+  /**
+   * One request has already waited its full timeout and found no session, so
+   * the rest do not wait too.
+   *
+   * The wait is a bet on a session arriving shortly, but the thing being bet
+   * on is per-TAB, not per-request. Paying it per request is how a page with
+   * hundreds of resources turned one slow bootstrap into hundreds of separate
+   * 400 ms stalls: measured on a Next.js build, every render-blocking chunk
+   * sat for the full hold and then fell back anyway, costing ~480 ms each on
+   * the critical path (vrek dec-s6ff87p, and the trace that found it).
+   *
+   * Cleared implicitly: once `info` arrives, this is never read again.
+   */
+  gaveUp: boolean;
 }
 
 const tabs = new Map<string, TabState>();
@@ -94,11 +108,17 @@ async function serve(req: Request, clientId: string): Promise<Response> {
   const tab = tabs.get(clientId) ?? hello(client);
   if (!tab.info) {
     if (!(await tab.acked)) return network("fallback", "tab has no HTTP4 bridge");
+    if (tab.gaveUp) return network("fallback", "tab's HTTP4 session still not ready");
     // How long this is worth waiting depends on what the request is for: a
     // stylesheet delays first paint, an image delays nothing (readyTimeoutMs).
     const waitMs = readyTimeoutMs(req.destination);
     const info = await Promise.race([tab.ready, sleep(waitMs).then(() => undefined)]);
-    if (!info) return network("fallback", `tab's HTTP4 session not ready after ${waitMs} ms`);
+    if (!info) {
+      // Only the first request pays this. Waiting again for every following
+      // one multiplies a single slow bootstrap by the page's resource count.
+      tab.gaveUp = true;
+      return network("fallback", `tab's HTTP4 session not ready after ${waitMs} ms`);
+    }
   }
   const info = tab.info!;
   if (!info.available) return network("fallback", info.reason ?? "HTTP4 unavailable in tab");
@@ -128,6 +148,7 @@ function hello(client: SwClient): TabState {
   const tab: TabState = {
     acked: new Promise((r) => (ack = r)),
     ready: new Promise((r) => (ready = r)),
+    gaveUp: false,
   };
   ch.port1.onmessage = (e: MessageEvent<HelloReply>) => {
     ack(true);

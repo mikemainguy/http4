@@ -14,10 +14,12 @@ package server
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // newPassThrough builds the reverse proxy for one origin. The origin must be
@@ -39,6 +41,20 @@ func newPassThrough(origin string) (http.Handler, error) {
 	}
 
 	proxy := &httputil.ReverseProxy{
+		// http.DefaultTransport leaves MaxIdleConnsPerHost at its default of 2,
+		// which is the wrong shape for a reverse proxy: every request here goes
+		// to ONE origin, so a page pulling dozens of assets keeps two
+		// connections warm and reopens the rest. Pool for one busy upstream
+		// instead.
+		Transport: &http.Transport{
+			DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			MaxIdleConns:          256,
+			MaxIdleConnsPerHost:   256,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: time.Second,
+			ForceAttemptHTTP2:     true,
+		},
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(u)
 			// The application needs to know what the browser actually asked
