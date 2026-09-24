@@ -42,6 +42,36 @@ Three things to know:
 - **A wrong but *usable* URL is still used, not validated.** `https://typo.example/wt` will be dialled, fail, and
   leave the page fallback-only. Relative URLs avoid this whole class of mistake.
 
+## Starting the handshake before the client loads
+
+The remaining cost in the bootstrap is the WebTransport handshake itself: it cannot start until `auto.js` has
+downloaded and run, so the chain is *HTML → auto.js → handshake*, three serial round trips before the first HTTP4
+byte. A page can collapse that to one by starting the handshake from the HTML:
+
+```html
+<script>try{window.__http4Preconnect=new WebTransport(location.origin+"/wt")}catch(e){}</script>
+<script type="application/http4-config">{"webTransportUrl": "/wt", "assetPrefix": "/"}</script>
+<script src="/http4/auto.js"></script>
+```
+
+About 70 bytes. The handshake now runs **in parallel** with `auto.js` downloading and with every subresource the
+preload scanner dispatches; by the time the library runs, the session is often already open, and it adopts it
+rather than starting a second one.
+
+**Inlining `auto.js` itself is the wrong trade.** It is 70 KB raw, 19 KB gzipped, against a typical 23 KB HTML
+document — roughly doubling the file that the preload scanner must parse before it can request anything at all.
+The handshake is what costs a round trip; the library is just bytes.
+
+Four things to know:
+
+- **Trusted certificates only.** A development certificate is pinned with `serverCertificateHashes`, which inline
+  HTML cannot know, so the snippet would open a session the browser rejects. Use it in production, leave it out
+  locally — with `bin/http4d serve` the `try/catch` swallows the failure and the normal path takes over.
+- **The URL is hardcoded**, so this works when WebTransport is on the page's own origin and port (`-http :443
+  -wt :443`). With a separate port, write it out in full.
+- **`?http4=off` still works.** The comparison arm ignores an adopted session rather than holding one open.
+- **A failure is harmless.** If the handshake fails, the library falls back exactly as it would have.
+
 ## Tuning, without writing JavaScript
 
 The same inline block can carry session settings, so a site can tune HTTP4 from HTML alone:

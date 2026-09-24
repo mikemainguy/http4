@@ -251,3 +251,39 @@ test("stats echo the settings in force, so an ignored tuning value is visible", 
   const o = await open({ baseUrl: base, fetch: cfgFetch({ webTransportUrl: "https://x/wt", assetPrefix: "/", tuning: applied }) });
   assert.equal(o.assetPrefix, "/");
 });
+
+test("an already-started session is adopted instead of opening a second one", async () => {
+  const base = ORIGIN + "/index.html";
+  // Stand in for a WebTransport the page began in its HTML. Http4Client.connect
+  // awaits `ready`, so it may still be connecting when handed over.
+  let opened = 0;
+  const fake = {
+    ready: Promise.resolve(),
+    closed: new Promise(() => {}),
+    datagrams: { readable: new ReadableStream(), writable: new WritableStream() },
+    close() {},
+  } as unknown as WebTransport;
+
+  const cfgFetch = async () =>
+    new Response(JSON.stringify({ webTransportUrl: "https://x/wt", assetPrefix: "/" }), {
+      headers: { "content-type": "application/json" },
+    });
+  const g = globalThis as { WebTransport?: unknown };
+  const had = "WebTransport" in g;
+  // Node has no WebTransport; define one that counts construction, so an
+  // adopted session is distinguishable from a freshly opened one.
+  g.WebTransport = class {
+    constructor() {
+      opened++;
+    }
+  };
+  try {
+    await open({ baseUrl: base, fetch: cfgFetch, session: fake });
+    assert.equal(opened, 0, "a provided session must be used, not a new one");
+
+    await open({ baseUrl: base, fetch: cfgFetch });
+    assert.equal(opened, 1, "with no session provided, one is constructed");
+  } finally {
+    if (!had) delete g.WebTransport;
+  }
+});

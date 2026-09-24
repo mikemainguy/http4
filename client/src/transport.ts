@@ -83,6 +83,13 @@ export interface ClientOptions {
    * granted until the reader catches up.
    */
   streamHighWaterMark?: number;
+  /**
+   * An already-constructed WebTransport to use instead of opening one. The
+   * page can start the handshake from the HTML, before this code has loaded,
+   * so the connect round trip overlaps the library's own download. Its
+   * `ready` is awaited here, so it may still be connecting when passed.
+   */
+  session?: WebTransport;
   /** Record every grant decision (for tests). */
   trace?: GrantTrace[];
   /** TESTING ONLY: return true to drop an outgoing packet, simulating loss. */
@@ -351,9 +358,19 @@ export class Http4Client {
     });
   }
 
+  /**
+   * Open a session, or adopt one a page already started.
+   *
+   * `session` lets a tiny inline script in the HTML begin the WebTransport
+   * handshake before this library has even downloaded, so the round trip it
+   * costs overlaps with fetching and parsing the client rather than following
+   * it (vrek iss-rba9103). The caller is trusted to have used the right URL;
+   * nothing here can check that, which is why it is only safe with a
+   * CA-trusted certificate — a pinned hash is not knowable from inline HTML.
+   */
   static async connect(url: string, certHash?: Uint8Array<ArrayBuffer>, opts: ClientOptions = {}): Promise<Http4Client> {
     // No hash (a CA-trusted certificate): let the browser verify it normally.
-    const wt = new WebTransport(url, certHash?.length ? { serverCertificateHashes: [{ algorithm: "sha-256", value: certHash }] } : {});
+    const wt = opts.session ?? new WebTransport(url, certHash?.length ? { serverCertificateHashes: [{ algorithm: "sha-256", value: certHash }] } : {});
     await wt.ready;
     return new Http4Client(wt, opts);
   }
